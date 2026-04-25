@@ -1032,11 +1032,10 @@ def paste_target(
 ) -> PasteResult:
     """High-level: extract target, match radiometry, blend into bg.
 
-    Default is ``method="laplacian"`` with ``tv_smooth=True`` — this
-    combination had the lowest seam-gradient in the TV comparison
-    (≈ 23 % below plain alpha) while preserving IR radiometric
-    contrast. Use ``method="alpha"`` for the fastest path, or
-    ``method="poisson"`` only when the source target has strong
+    Default is ``method="laplacian"``. For the lowest seam gradient,
+    enable ``tv_smooth=True`` (≈ 23 % below plain alpha) while preserving
+    IR radiometric contrast. Use ``method="alpha"`` for the fastest path,
+    or ``method="poisson"`` only when the source target has strong
     internal texture you want to preserve (Poisson's mean-retargeting
     will otherwise wash out low-texture IR ships).
 
