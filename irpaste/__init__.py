@@ -42,6 +42,7 @@ __all__ = [
     "build_mask",
     "load_sample",
     "load_background",
+    "paste_patch",
     "paste_target",
     # utilities
     "augment_background",
