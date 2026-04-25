@@ -287,7 +287,8 @@ def choose_paste_site(
                 if _overlap_ok(x, y_candidate):
                     return x, y_candidate
 
-        # No overlap-free site found after retries — accept best-effort.
+        # No overlap-free site found after retries — accept best-effort
+        # but still honour horizon constraints.
         if len(valid_x_sorted) > 1:
             idx = _center_biased_int(rng, 0, len(valid_x_sorted) - 1, bias=2.0)
             x = int(valid_x_sorted[idx])
@@ -295,18 +296,36 @@ def choose_paste_site(
             x = int(valid_x_sorted[0])
         hr_local = _horizon_at(bg_view, x + pw / 2.0, horizon_mid)
         if target_on_horizon:
-            return x, y_hi
+            min_sea_rows = max(4, ph // 3)
+            jitter = int(rng.integers(-2, 3))
+            y_ideal = hr_local - (ph - min_sea_rows) + jitter
+            y = int(np.clip(y_ideal, y_lo, y_hi))
+            return x, y
         buffer = max(2, ph // 8)
-        y_clamped = min(y_hi, max(y_lo, hr_local + buffer))
-        return x, max(y_lo, y_clamped)
+        y_sea_lo = min(y_hi, max(y_lo, hr_local + buffer))
+        if y_sea_lo < y_hi:
+            y = _center_biased_int(rng, y_sea_lo, y_hi, bias=2.0)
+        else:
+            y = y_sea_lo
+        return x, max(y_lo, y)
 
-    # -- Top-down bg — center-biased, try to avoid overlap --------------
+    # -- Top-down bg — center-biased, try to avoid overlap, then accept best-effort
     for _ in range(max_retry):
         x = _center_biased_int(rng, x_lo, x_hi, bias=2.0)
         y = _center_biased_int(rng, y_lo, y_hi, bias=2.0)
         if _overlap_ok(x, y):
             return x, y
-    # Fallback — center-biased
+    # Fallback — still prefer no overlap, but accept if unavoidable.
+    for _ in range(max_retry):
+        x = _center_biased_int(rng, x_lo, x_hi, bias=2.0)
+        y = _center_biased_int(rng, y_lo, y_hi, bias=2.0)
+        if occupied_mask is None or not occupied_mask.any():
+            return x, y
+        region = occupied_mask[y : y + ph, x : x + pw]
+        if region.size == 0:
+            return x, y
+        if float(region.mean()) < 0.25:  # <= 25% overlap as last resort
+            return x, y
     x = _center_biased_int(rng, x_lo, x_hi, bias=2.0)
     y = _center_biased_int(rng, y_lo, y_hi, bias=2.0)
     return x, y
