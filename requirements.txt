@@ -1,0 +1,10 @@
+# IRPaste runtime dependencies
+# Python >= 3.12 required
+#
+# Generated from pyproject.toml
+# Install with: pip install -r requirements.txt
+
+numpy>=2.4.4
+opencv-python>=4.13.0.92
+pillow>=12.2.0
+scikit-image>=0.26.0

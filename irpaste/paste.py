@@ -43,15 +43,15 @@ BlendMethod = Literal["poisson", "alpha", "laplacian"]
 
 @dataclass
 class PasteResult:
-    composite: np.ndarray                 # uint8 (H, W) final composite
-    bg: np.ndarray                        # uint8 (H, W) background
-    target_patch: np.ndarray              # uint8 tight target crop (radiometrically matched)
-    mask_patch: np.ndarray                # bool tight mask
-    paste_xy: Tuple[int, int]             # top-left corner of target crop on bg
+    composite: np.ndarray  # uint8 (H, W) final composite
+    bg: np.ndarray  # uint8 (H, W) background
+    target_patch: np.ndarray  # uint8 tight target crop (radiometrically matched)
+    mask_patch: np.ndarray  # bool tight mask
+    paste_xy: Tuple[int, int]  # top-left corner of target crop on bg
     method: BlendMethod
     bg_view: BackgroundView
-    target_on_horizon: bool = False       # target straddles sim-image horizon
-    sim_horizon_row: Optional[int] = None # detected horizon row in sim image (if any)
+    target_on_horizon: bool = False  # target straddles sim-image horizon
+    sim_horizon_row: Optional[int] = None  # detected horizon row in sim image (if any)
     radiometric: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
@@ -68,18 +68,23 @@ def _to_gray_u8(img: np.ndarray) -> np.ndarray:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if img.dtype != np.uint8:
         lo, hi = np.percentile(img, (1, 99))
-        img = np.clip((img - lo) * (255.0 / max(hi - lo, 1e-6)), 0, 255).astype(np.uint8)
+        img = np.clip((img - lo) * (255.0 / max(hi - lo, 1e-6)), 0, 255).astype(
+            np.uint8
+        )
     return img
 
 
 def load_background(path: str | Path) -> np.ndarray:
-    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    buf = np.fromfile(str(path), dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(path)
     return _to_gray_u8(img)
 
 
-def target_patch_from_sample(sample: Sample, mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]:
+def target_patch_from_sample(
+    sample: Sample, mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]:
     """Crop a tight patch around the mask; return (patch_u8, mask_bool, bbox)."""
     ys, xs = np.where(mask)
     if ys.size == 0:
@@ -93,7 +98,9 @@ def target_patch_from_sample(sample: Sample, mask: np.ndarray) -> tuple[np.ndarr
     else:
         rad = sample.radiance[y0:y1, x0:x1]
         lo, hi = float(rad.min()), float(rad.max())
-        patch = np.clip((rad - lo) * (255.0 / max(hi - lo, 1e-6)), 0, 255).astype(np.uint8)
+        patch = np.clip((rad - lo) * (255.0 / max(hi - lo, 1e-6)), 0, 255).astype(
+            np.uint8
+        )
     m = mask[y0:y1, x0:x1].astype(bool)
     return patch, m, (x0, y0, x1, y1)
 
@@ -160,6 +167,21 @@ def _horizon_at(bg_view: BackgroundView, x: float, default: int) -> int:
     return int(default)
 
 
+def _center_biased_int(
+    rng: np.random.Generator, lo: int, hi: int, bias: float = 2.0
+) -> int:
+    """Return a random integer in [lo, hi] biased toward the center.
+
+    Uses a Beta(``bias``, ``bias``) distribution symmetric about 0.5 so the
+    expected value is the centre of the interval.  ``bias=1`` = uniform;
+    ``bias=2`` = mild centre bias; ``bias=3`` = stronger centre bias.
+    """
+    if hi <= lo:
+        return lo
+    t = float(rng.beta(bias, bias))
+    return int(round(lo + t * (hi - lo)))
+
+
 def choose_paste_site(
     bg: np.ndarray,
     bg_view: BackgroundView,
@@ -167,13 +189,14 @@ def choose_paste_site(
     rng: np.random.Generator,
     margin: int = 8,
     target_on_horizon: bool = False,
+    occupied_mask: Optional[np.ndarray] = None,
+    max_retry: int = 40,
 ) -> tuple[int, int]:
     """Return the top-left (x, y) of the target patch on ``bg``.
 
     Placement rules
     ---------------
-    * **Top-down bg** — anywhere inside the frame (random uniform with
-      ``margin`` px border).
+    * **Top-down bg** — anywhere inside the frame with centre bias.
     * **Side-view bg with ``target_on_horizon=True``** — the ship's
       *bottom* lands on the bg horizon at the patch's horizontal centre,
       i.e. ``y_top = horizon(x_center) − ph``. When a quadratic
@@ -184,13 +207,34 @@ def choose_paste_site(
 
     A prow-exclusion column filter avoids saturated/dead-zone columns on
     side-view backgrounds.
+
+    When ``occupied_mask`` is provided, placements that overlap already-
+    occupied pixels (ship/hull areas) are penalised and skipped in favour
+    of non-overlapping alternatives.
+
+    Ships are biased toward the center of the frame (away from image
+    borders) using a dynamic margin of 1/12 of the smaller dimension.
     """
     H, W = bg.shape
     pw, ph = patch_wh
-    x_lo, x_hi = margin, W - pw - margin
-    y_lo, y_hi = margin, H - ph - margin
+
+    # Dynamic margin: keep ships away from boundaries.
+    # At least 1/12 of the smaller dimension, clamped to [30, 80] px,
+    # but never less than the caller-requested margin.
+    dyn_margin = max(margin, min(80, max(30, min(H, W) // 12)))
+    x_lo, x_hi = dyn_margin, W - pw - dyn_margin
+    y_lo, y_hi = dyn_margin, H - ph - dyn_margin
     if x_hi <= x_lo or y_hi <= y_lo:
         return max(0, (W - pw) // 2), max(0, (H - ph) // 2)
+
+    # Overlap penalty function.
+    def _overlap_ok(xx: int, yy: int) -> bool:
+        if occupied_mask is None or not occupied_mask.any():
+            return True
+        region = occupied_mask[yy : yy + ph, xx : xx + pw]
+        if region.size == 0:
+            return False
+        return float(region.mean()) < 0.08  # < 8 % overlap is OK
 
     # -- Side-view bg --------------------------------------------------
     if bg_view.kind == "side" and bg_view.horizon_row is not None:
@@ -213,27 +257,77 @@ def choose_paste_site(
         valid_x = valid_x[col_ok[valid_x]] if col_ok.size == W else valid_x
         if valid_x.size == 0:
             valid_x = np.arange(x_lo, x_hi + 1)
-        x = int(rng.choice(valid_x))
+        valid_x_sorted = np.sort(valid_x)
 
-        # Horizon at the patch's horizontal centre.
+        for _ in range(max_retry):
+            # Center-biased column selection.
+            if len(valid_x_sorted) > 1:
+                idx = _center_biased_int(rng, 0, len(valid_x_sorted) - 1, bias=2.0)
+                x = int(valid_x_sorted[idx])
+            else:
+                x = int(valid_x_sorted[0])
+            hr_local = _horizon_at(bg_view, x + pw / 2.0, horizon_mid)
+
+            if target_on_horizon:
+                # Ensure at least 1/3 of the ship patch sits below the horizon
+                # so the hull appears in the sea rather than the whole patch
+                # floating in the sky.
+                min_sea_rows = max(4, ph // 3)
+                jitter = int(rng.integers(-2, 3))
+                y_ideal = hr_local - (ph - min_sea_rows) + jitter
+                if y_ideal >= y_lo and y_ideal + ph <= H:
+                    y_candidate = int(np.clip(y_ideal, y_lo, y_hi))
+                    if _overlap_ok(x, y_candidate):
+                        return x, y_candidate
+                # Fall through to ocean placement.
+            buffer = max(2, ph // 8)
+            y_sea_lo = min(y_hi, max(y_lo, hr_local + buffer))
+            if y_sea_lo < y_hi:
+                y_candidate = _center_biased_int(rng, y_sea_lo, y_hi, bias=2.0)
+                if _overlap_ok(x, y_candidate):
+                    return x, y_candidate
+
+        # No overlap-free site found after retries — accept best-effort
+        # but still honour horizon constraints.
+        if len(valid_x_sorted) > 1:
+            idx = _center_biased_int(rng, 0, len(valid_x_sorted) - 1, bias=2.0)
+            x = int(valid_x_sorted[idx])
+        else:
+            x = int(valid_x_sorted[0])
         hr_local = _horizon_at(bg_view, x + pw / 2.0, horizon_mid)
-
         if target_on_horizon:
+            min_sea_rows = max(4, ph // 3)
             jitter = int(rng.integers(-2, 3))
-            y = int(np.clip(hr_local - ph + jitter, y_lo, y_hi))
+            y_ideal = hr_local - (ph - min_sea_rows) + jitter
+            y = int(np.clip(y_ideal, y_lo, y_hi))
             return x, y
-
-        # Ship entirely in ocean: strictly below horizon at that column.
         buffer = max(2, ph // 8)
         y_sea_lo = min(y_hi, max(y_lo, hr_local + buffer))
-        if y_sea_lo >= y_hi:
-            return x, int(np.clip(hr_local - ph, y_lo, y_hi))
-        y = int(rng.integers(y_sea_lo, y_hi + 1))
-        return x, y
+        if y_sea_lo < y_hi:
+            y = _center_biased_int(rng, y_sea_lo, y_hi, bias=2.0)
+        else:
+            y = y_sea_lo
+        return x, max(y_lo, y)
 
-    # -- Top-down bg — anywhere ---------------------------------------
-    x = int(rng.integers(x_lo, x_hi + 1))
-    y = int(rng.integers(y_lo, y_hi + 1))
+    # -- Top-down bg — center-biased, try to avoid overlap, then accept best-effort
+    for _ in range(max_retry):
+        x = _center_biased_int(rng, x_lo, x_hi, bias=2.0)
+        y = _center_biased_int(rng, y_lo, y_hi, bias=2.0)
+        if _overlap_ok(x, y):
+            return x, y
+    # Fallback — still prefer no overlap, but accept if unavoidable.
+    for _ in range(max_retry):
+        x = _center_biased_int(rng, x_lo, x_hi, bias=2.0)
+        y = _center_biased_int(rng, y_lo, y_hi, bias=2.0)
+        if occupied_mask is None or not occupied_mask.any():
+            return x, y
+        region = occupied_mask[y : y + ph, x : x + pw]
+        if region.size == 0:
+            return x, y
+        if float(region.mean()) < 0.25:  # <= 25% overlap as last resort
+            return x, y
+    x = _center_biased_int(rng, x_lo, x_hi, bias=2.0)
+    y = _center_biased_int(rng, y_lo, y_hi, bias=2.0)
     return x, y
 
 
@@ -242,7 +336,9 @@ def choose_paste_site(
 # --------------------------------------------------------------------------- #
 
 
-def _bg_ring_stats(bg: np.ndarray, x: int, y: int, pw: int, ph: int, ring: int = 10) -> tuple[float, float]:
+def _bg_ring_stats(
+    bg: np.ndarray, x: int, y: int, pw: int, ph: int, ring: int = 10
+) -> tuple[float, float]:
     H, W = bg.shape
     x0 = max(0, x - ring)
     y0 = max(0, y - ring)
@@ -294,9 +390,13 @@ def radiometric_match(
     shift = new_mean - tgt_mean
     p = p + shift
 
-    # Contrast clamp (only rescale the target pixels, softly).
-    if tgt_std > 3.0 * bg_std:
-        scale = (2.0 * bg_std) / tgt_std
+    # Contrast clamp: only rescale if target is extremely over-contrasted
+    # relative to the local background.  The old threshold (3×) fired too
+    # readily on bright MWIR ships against calm-sea backgrounds, flattening
+    # the target’s internal structure into a featureless blob.  The new
+    # threshold (8×) reserves the clamp for obvious simulation artefacts.
+    if tgt_std > 8.0 * bg_std:
+        scale = (4.0 * bg_std) / tgt_std
         p_masked = p.copy()
         p_masked[mask] = new_mean + (p[mask] - new_mean) * scale
         p = p_masked
@@ -328,26 +428,51 @@ def _feather_alpha(mask: np.ndarray, dilate: int = 1, sigma: float = 1.2) -> np.
     """
     m = mask.astype(np.uint8) * 255
     if dilate > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
+        k = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1)
+        )
         m = cv2.dilate(m, k)
     ksz = max(3, int(sigma * 6) | 1)
     a = cv2.GaussianBlur(m, (ksz, ksz), sigma)
     return a.astype(np.float32) / 255.0
 
 
-def _blend_alpha(bg_patch: np.ndarray, fg_patch: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    a = _feather_alpha(mask, dilate=1, sigma=1.2)
-    out = a * fg_patch.astype(np.float32) + (1 - a) * bg_patch.astype(np.float32)
+def _composite_fg(
+    fg_patch: np.ndarray, bg_patch: np.ndarray, mask: np.ndarray
+) -> np.ndarray:
+    """Return a composite where only mask pixels come from *fg_patch*;
+    non-mask pixels are taken from *bg_patch*.
+
+    This prevents the simulation-source background texture (the area
+    around the ship in the synthetic image) from bleeding into the
+    Laplacian pyramid or the alpha weighting, which is the root cause
+    of the visible halo / shadow around pasted ships.
+    """
+    out = bg_patch.astype(np.float32).copy()
+    out[mask] = fg_patch.astype(np.float32)[mask]
+    return out
+
+
+def _blend_alpha(
+    bg_patch: np.ndarray, fg_patch: np.ndarray, mask: np.ndarray
+) -> np.ndarray:
+    # Zero out simulation background outside the mask before blending so
+    # synthetic-background halo / shadow cannot appear.
+    fg_clean = _composite_fg(fg_patch, bg_patch, mask)
+    a = _feather_alpha(mask, dilate=0, sigma=0.6)
+    out = a * fg_clean + (1 - a) * bg_patch.astype(np.float32)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def _blend_poisson(bg: np.ndarray, fg_patch: np.ndarray, mask: np.ndarray, paste_xy: tuple[int, int]) -> np.ndarray:
+def _blend_poisson(
+    bg: np.ndarray, fg_patch: np.ndarray, mask: np.ndarray, paste_xy: tuple[int, int]
+) -> np.ndarray:
     """Poisson (``seamlessClone``, NORMAL_CLONE) on grayscale via 3-ch wrap."""
     x, y = paste_xy
     ph, pw = fg_patch.shape
     bg_bgr = cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
     fg_bgr = cv2.cvtColor(fg_patch, cv2.COLOR_GRAY2BGR)
-    m = (mask.astype(np.uint8) * 255)
+    m = mask.astype(np.uint8) * 255
     # seamlessClone requires the clone center AND the mask not to touch
     # the image border; clamp the center to avoid OpenCV assertion.
     H, W = bg.shape
@@ -385,11 +510,17 @@ def _laplacian_pyramid(img: np.ndarray, n: int) -> list[np.ndarray]:
     return lp
 
 
-def _blend_laplacian(bg_patch: np.ndarray, fg_patch: np.ndarray, mask: np.ndarray, levels: int = 3) -> np.ndarray:
-    # Work on matched-size patches only.
-    a = _feather_alpha(mask, dilate=1, sigma=1.0)
+def _blend_laplacian(
+    bg_patch: np.ndarray, fg_patch: np.ndarray, mask: np.ndarray, levels: int = 3
+) -> np.ndarray:
+    # Replace simulation background with real bg before building the pyramid.
+    # Without this, non-mask pixels from the synthetic image (different texture)
+    # bleed across the mask boundary through Gaussian down-sampling, creating
+    # a visible halo around the ship silhouette.
+    fg_clean = _composite_fg(fg_patch, bg_patch, mask)
+    a = _feather_alpha(mask, dilate=0, sigma=0.6)
     lp_a = _gaussian_pyramid(a, levels)
-    lp_f = _laplacian_pyramid(fg_patch, levels)
+    lp_f = _laplacian_pyramid(fg_clean, levels)
     lp_b = _laplacian_pyramid(bg_patch, levels)
     blended = []
     for la, lf, lb in zip(lp_a, lp_f, lp_b):
@@ -401,6 +532,58 @@ def _blend_laplacian(bg_patch: np.ndarray, fg_patch: np.ndarray, mask: np.ndarra
         out = cv2.pyrUp(out, dstsize=(blended[i].shape[1], blended[i].shape[0]))
         out = out + blended[i]
     return np.clip(out, 0, 255).astype(np.uint8)
+
+
+# --------------------------------------------------------------------------- #
+# Post-paste adaptive boundary blur
+# --------------------------------------------------------------------------- #
+
+
+def _adaptive_boundary_blur(
+    composite: np.ndarray,
+    full_mask: np.ndarray,
+) -> np.ndarray:
+    """Smooth the mask boundary ring after pasting to eliminate seam artifacts.
+
+    Only the dilated boundary ring (not the ship interior) is blurred, so
+    internal ship details are preserved.  The blur sigma scales with the
+    square-root of the ship area so tiny targets are left untouched while
+    large ships get a wider transition.
+
+    ``sigma`` schedule:
+    * ship_size = √(mask_area)
+    * sigma     = clip(ship_size / 80, 0.5, 3.0)
+    * skip entirely when ship_size < 15 px (very small target)
+    """
+    mask_area = int(full_mask.sum())
+    ship_size = float(np.sqrt(max(mask_area, 1)))
+    if ship_size < 15.0:
+        return composite
+
+    sigma = float(np.clip(ship_size / 80.0, 0.5, 3.0))
+    ring_w = max(2, int(sigma * 2.0))
+
+    m_u8 = full_mask.astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring_w + 1, 2 * ring_w + 1))
+    # Build a SMOOTH radial weight so the blend has no hard rectangular
+    # boundary.  A binary cv2.dilate followed by a Gaussian blur creates
+    # a continuous falloff from 1.0 at the ship silhouette to 0.0 beyond
+    # the dilation ring, preventing the visible "frame" artifact that
+    # appeared when blurred and non-blurred regions met at a hard edge.
+    dilated = cv2.dilate(m_u8, k)
+    blur_k = max(3, ring_w * 4 + 1) | 1  # odd kernel; wider than ring_w
+    ring_f = cv2.GaussianBlur(
+        dilated.astype(np.float32) / 255.0,
+        (blur_k, blur_k),
+        max(1.0, ring_w * 1.5),
+    )
+
+    ksz = max(3, int(sigma * 4) | 1)
+    img_f = composite.astype(np.float32)
+    blurred = cv2.GaussianBlur(img_f, (ksz, ksz), sigma)
+    # Blend: boundary zone uses blurred; away from mask uses original
+    result = img_f * (1.0 - ring_f) + blurred * ring_f
+    return np.clip(result, 0, 255).astype(np.uint8)
 
 
 # --------------------------------------------------------------------------- #
@@ -484,79 +667,324 @@ def tv_boundary_smooth(
 
 
 # --------------------------------------------------------------------------- #
-# Top-level paste API
+# Background zoom-in augmentation
 # --------------------------------------------------------------------------- #
 
 
-def paste_target(
-    sample: Sample,
+def augment_background(
+    bg: np.ndarray,
+    rng: np.random.Generator,
+    scale_range: tuple[float, float] = (1.0, 1.4),
+    n_candidates: int = 10,
+) -> np.ndarray:
+    """Randomly zoom into *bg* by a factor drawn from *scale_range*, then
+    crop back to the original spatial dimensions using a **smart crop
+    selection** strategy.
+
+    Instead of a purely random crop offset, we sample *n_candidates*
+    candidate windows and score each by:
+
+    1. **Border cleanliness** — penalise crops whose border strip is very
+       different from the interior (black-edge / blown-out artefacts that
+       appear when the zoom window reaches the physical image boundary).
+    2. **Texture richness** — prefer windows with healthy variance so the
+       composited ship has a realistic clutter background.
+    3. **Horizon stability** (side-view) — prefer windows whose horizon
+       row stays close to the original horizon row (avoids cropping to
+       pure sky or pure sea).
+
+    A scale of 1.0 returns a copy unchanged.  Values above ~1.5 risk
+    cutting out the sea-sky horizon on side-view images, so the
+    recommended upper bound is 1.4.
+    """
+    H, W = bg.shape
+    scale = float(rng.uniform(scale_range[0], scale_range[1]))
+    if scale <= 1.0 + 1e-4:
+        return bg.copy()
+    new_H = int(round(H * scale))
+    new_W = int(round(W * scale))
+    scaled = cv2.resize(bg, (new_W, new_H), interpolation=cv2.INTER_LINEAR)
+
+    max_y_off = max(0, new_H - H)
+    max_x_off = max(0, new_W - W)
+
+    # Pre-compute the global texture level to normalise scores.
+    global_std = float(np.std(bg)) + 1e-3
+
+    # Estimate original horizon row (cheap: look at vertical gradient).
+    orig_horizon: Optional[int] = None
+    row_mean = bg.mean(axis=1)
+    grad1d = np.abs(np.diff(row_mean.astype(np.float32)))
+    y_lo_h = max(4, int(H * 0.25))
+    y_hi_h = int(H * 0.75)
+    if y_hi_h > y_lo_h + 4:
+        sub_g = grad1d[y_lo_h:y_hi_h]
+        thr = float(np.percentile(sub_g, 55))
+        strong_idx = np.where(sub_g >= thr)[0]
+        if strong_idx.size:
+            orig_horizon = y_lo_h + int(strong_idx[-1])
+
+    cand_y = rng.integers(0, max_y_off + 1, size=n_candidates).tolist()
+    cand_x = rng.integers(0, max_x_off + 1, size=n_candidates).tolist()
+    # Always include centre crop as a safe fallback.
+    cand_y[0] = max_y_off // 2
+    cand_x[0] = max_x_off // 2
+
+    best_score = -np.inf
+    best_y, best_x = int(cand_y[0]), int(cand_x[0])
+
+    for y_off, x_off in zip(cand_y, cand_x):
+        y_off, x_off = int(y_off), int(x_off)
+        crop = scaled[y_off : y_off + H, x_off : x_off + W]
+
+        # 1. Texture richness score (0–1).
+        crop_std = float(np.std(crop))
+        texture_score = crop_std / (crop_std + global_std)
+
+        # 2. Border cleanliness: compare border strip median vs interior.
+        border = 8
+        if border * 2 < H and border * 2 < W:
+            border_px = np.concatenate(
+                [
+                    crop[:border, :].ravel(),
+                    crop[-border:, :].ravel(),
+                    crop[:, :border].ravel(),
+                    crop[:, -border:].ravel(),
+                ]
+            )
+            interior = crop[border:-border, border:-border].ravel()
+            border_med = float(np.median(border_px))
+            int_med = float(np.median(interior))
+            int_range = float(np.ptp(interior)) + 1e-3
+            border_penalty = abs(border_med - int_med) / int_range
+        else:
+            border_penalty = 0.0
+
+        # 3. Horizon stability: for side-view images prefer crops where
+        #    the horizon row stays near its original position.
+        if orig_horizon is not None:
+            # After zooming and cropping, the original row `orig_horizon`
+            # maps to row `(orig_horizon * scale) - y_off` in the crop.
+            mapped_hr = orig_horizon * scale - y_off
+            horizon_dist = abs(mapped_hr - orig_horizon) / max(H, 1)
+            horizon_penalty = float(np.clip(horizon_dist, 0.0, 1.0))
+        else:
+            horizon_penalty = 0.0
+
+        score = texture_score - 0.4 * border_penalty - 0.3 * horizon_penalty
+        if score > best_score:
+            best_score = score
+            best_y, best_x = y_off, x_off
+
+    return scaled[best_y : best_y + H, best_x : best_x + W].copy()
+
+
+# --------------------------------------------------------------------------- #
+# Ship principal-axis / horizon alignment
+# --------------------------------------------------------------------------- #
+
+
+def get_mask_principal_angle(mask: np.ndarray) -> float:
+    """Return the angle (degrees) of the **principal (long) axis** of *mask*
+    via PCA on pixel coordinates.
+
+    Convention: 0° = horizontal; positive values tilt clockwise.
+    Output range: ``[-90, 90)``.
+    """
+    ys, xs = np.where(mask)
+    if xs.size < 5:
+        return 0.0
+    pts = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
+    mean = pts.mean(axis=0)
+    pts_c = pts - mean
+    cov = (pts_c.T @ pts_c) / max(len(pts) - 1, 1)
+    # eigh returns eigenvalues in ascending order; last eigenvector = principal
+    _, vecs = np.linalg.eigh(cov)
+    vx, vy = vecs[:, -1]
+    angle = float(np.degrees(np.arctan2(vy, vx)))
+    if angle > 90.0:
+        angle -= 180.0
+    elif angle <= -90.0:
+        angle += 180.0
+    return angle
+
+
+def get_horizon_tangent_angle(bg_view: BackgroundView, x_center: float) -> float:
+    """Tangent angle (degrees) of the horizon at column *x_center*.
+
+    For a quadratic horizon ``y = a·x² + b·x + c`` the tangent slope is
+    ``dy/dx = 2a·x + b``.  A straight (or absent) horizon returns 0°.
+    """
+    if bg_view.kind != "side" or bg_view.horizon_curve is None:
+        return 0.0
+    c = bg_view.horizon_curve
+    dydx = 2.0 * c.a * x_center + c.b
+    return float(np.degrees(np.arctan(dydx)))
+
+
+def rotate_patch_to_angle(
+    patch: np.ndarray,
+    mask: np.ndarray,
+    angle_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate *patch* and *mask* by *angle_deg* degrees (positive = clockwise),
+    expanding the canvas so no content is clipped.
+
+    Returns ``(rotated_patch, rotated_mask_bool)``.
+    """
+    if abs(angle_deg) < 0.3:
+        return patch.copy(), mask.astype(bool).copy()
+    h, w = patch.shape[:2]
+    cx, cy = w / 2.0, h / 2.0
+    # cv2 convention: positive angle = counter-clockwise → negate for CW
+    M = cv2.getRotationMatrix2D((cx, cy), -angle_deg, 1.0)
+    cos_a = abs(M[0, 0])
+    sin_a = abs(M[0, 1])
+    new_w = int(h * sin_a + w * cos_a) + 2
+    new_h = int(h * cos_a + w * sin_a) + 2
+    M[0, 2] += (new_w - w) / 2.0
+    M[1, 2] += (new_h - h) / 2.0
+    rot_patch = cv2.warpAffine(
+        patch, M, (new_w, new_h), flags=cv2.INTER_LINEAR, borderValue=0
+    )
+    rot_mask_f = cv2.warpAffine(
+        mask.astype(np.float32),
+        M,
+        (new_w, new_h),
+        flags=cv2.INTER_LINEAR,
+        borderValue=0,
+    )
+    rot_mask = rot_mask_f > 0.5
+    return rot_patch, rot_mask
+
+
+# --------------------------------------------------------------------------- #
+# paste_patch — low-level entry point for pre-tight-cropped targets
+# --------------------------------------------------------------------------- #
+
+
+def paste_patch(
+    patch: np.ndarray,
     mask: np.ndarray,
     bg: np.ndarray,
     *,
     method: BlendMethod = "laplacian",
-    bg_view: Optional[BackgroundView] = None,
-    target_on_horizon: Optional[bool] = None,
+    bg_view: BackgroundView,
+    target_on_horizon: bool = False,
     match_noise: bool = True,
-    tv_smooth: bool = True,
+    tv_smooth: bool = False,
     rng: Optional[np.random.Generator] = None,
+    align_to_horizon: bool = False,
+    ship_scale_range: tuple[float, float] = (0.55, 0.90),
+    occupied_mask: Optional[np.ndarray] = None,
 ) -> PasteResult:
-    """High-level: extract target, match radiometry, blend into bg.
+    """Paste a pre-cropped (patch, mask) pair onto a background.
 
-    Default is ``method="laplacian"`` with ``tv_smooth=True`` — this
-    combination had the lowest seam-gradient in the TV comparison
-    (≈ 23 % below plain alpha) while preserving IR radiometric
-    contrast. Use ``method="alpha"`` for the fastest path, or
-    ``method="poisson"`` only when the source target has strong
-    internal texture you want to preserve (Poisson's mean-retargeting
-    will otherwise wash out low-texture IR ships).
+    Unlike :func:`paste_target`, this function does NOT load samples,
+    extract masks, augment backgrounds, or classify views.  It receives
+    an already-tight-cropped target patch + mask and a fully-prepared
+    background, and handles the rest: scaling, rotation, placement,
+    radiometric matching, blending, and post-processing.
 
-    Placement is view-aware:
-
-    * side-view bg + target on sim horizon → bottom flush with bg horizon.
-    * side-view bg + target below sim horizon → entirely in the ocean.
-    * top-down bg → anywhere inside the frame.
-
-    ``target_on_horizon`` is auto-detected from the sim image when None.
+    Parameters
+    ----------
+    patch : np.ndarray
+        uint8 tight-cropped target patch.
+    mask : np.ndarray
+        bool tight mask (same shape as patch).
+    bg : np.ndarray
+        uint8 background (already augmented if desired).
+    bg_view : BackgroundView
+        Pre-computed background view classification.
+    target_on_horizon : bool
+        Whether the target straddles the sim horizon.
+    Other parameters : same as :func:`paste_target`.
     """
     if rng is None:
         rng = np.random.default_rng()
-    if bg_view is None:
-        bg_view = classify_background(bg, return_info=True)
 
-    if target_on_horizon is None:
-        on_horizon, sim_hr = detect_target_on_horizon(sample, mask)
-    else:
-        on_horizon = bool(target_on_horizon)
-        _, sim_hr = detect_target_on_horizon(sample, mask)
-
-    patch, m, _ = target_patch_from_sample(sample, mask)
+    notes: list[str] = []
+    H, W = bg.shape
     ph, pw = patch.shape
 
-    # Downscale patch if it cannot fit on bg.
-    H, W = bg.shape
+    # --- Downscale patch if it cannot fit on bg ---
     if ph >= H - 4 or pw >= W - 4:
         scale = min((W - 8) / pw, (H - 8) / ph)
         new_w = max(4, int(pw * scale))
         new_h = max(4, int(ph * scale))
         patch = cv2.resize(patch, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        m = cv2.resize(m.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+        mask = cv2.resize(
+            mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
         ph, pw = patch.shape
 
-    x, y = choose_paste_site(bg, bg_view, (pw, ph), rng, target_on_horizon=on_horizon)
+    # --- Optional principal-axis / horizon alignment ---
+    if align_to_horizon and bg_view.kind == "side":
+        principal_angle = get_mask_principal_angle(mask)
+        horizon_angle = get_horizon_tangent_angle(bg_view, W / 2.0)
+        rotation = horizon_angle - principal_angle
+        if abs(rotation) >= 0.3:
+            patch, mask = rotate_patch_to_angle(patch, mask, rotation)
+            ph, pw = patch.shape
+            notes.append(
+                f"axis-align: principal={principal_angle:.1f}deg "
+                f"horizon={horizon_angle:.1f}deg rot={rotation:.1f}deg"
+            )
+
+    # --- Optional ship downscale ---
+    s_lo, s_hi = ship_scale_range
+    if s_lo < s_hi:
+        ship_scale = float(rng.uniform(s_lo, s_hi))
+    else:
+        ship_scale = float(s_lo)
+    if ship_scale < 0.99:
+        new_pw = max(4, int(round(pw * ship_scale)))
+        new_ph = max(4, int(round(ph * ship_scale)))
+        patch = cv2.resize(patch, (new_pw, new_ph), interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(
+            mask.astype(np.uint8), (new_pw, new_ph), interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
+        ph, pw = patch.shape
+        notes.append(f"ship scale={ship_scale:.2f} -> {pw}x{ph}")
+
+    # --- Re-tight-crop after all transforms ---
+    _ys, _xs = np.where(mask)
+    if _ys.size > 0:
+        _y0c = int(_ys.min())
+        _y1c = int(_ys.max()) + 1
+        _x0c = int(_xs.min())
+        _x1c = int(_xs.max()) + 1
+        patch = patch[_y0c:_y1c, _x0c:_x1c]
+        mask = mask[_y0c:_y1c, _x0c:_x1c]
+        ph, pw = patch.shape
+
+    x, y = choose_paste_site(
+        bg, bg_view, (pw, ph), rng, target_on_horizon=target_on_horizon,
+        occupied_mask=occupied_mask,
+    )
+
+    # --- Erode mask by 1 px to shed bright anti-aliasing ring pixels ---
+    if int(mask.sum()) >= 30:
+        _k_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        _m_core = cv2.erode(mask.astype(np.uint8), _k_erode).astype(bool)
+        if int(_m_core.sum()) >= 10:
+            mask = _m_core
 
     bg_med, bg_std = _bg_ring_stats(bg, x, y, pw, ph, ring=max(5, min(pw, ph) // 2))
-    matched, radi_info = radiometric_match(patch, m, bg_med, bg_std, preserve_contrast=True)
+    matched, radi_info = radiometric_match(
+        patch, mask, bg_med, bg_std, preserve_contrast=True
+    )
 
     if method == "poisson":
-        composite = _blend_poisson(bg, matched, m, (x, y))
+        composite = _blend_poisson(bg, matched, mask, (x, y))
     elif method == "alpha":
         bg_patch = bg[y : y + ph, x : x + pw].copy()
-        blended = _blend_alpha(bg_patch, matched, m)
+        blended = _blend_alpha(bg_patch, matched, mask)
         composite = bg.copy()
         composite[y : y + ph, x : x + pw] = blended
     elif method == "laplacian":
         bg_patch = bg[y : y + ph, x : x + pw].copy()
-        blended = _blend_laplacian(bg_patch, matched, m, levels=3)
+        blended = _blend_laplacian(bg_patch, matched, mask, levels=3)
         composite = bg.copy()
         composite[y : y + ph, x : x + pw] = blended
     else:
@@ -564,12 +992,16 @@ def paste_target(
 
     # Full-frame mask for downstream ops.
     full_mask = np.zeros(bg.shape, dtype=bool)
-    full_mask[y : y + ph, x : x + pw] = m
+    full_mask[y : y + ph, x : x + pw] = mask
+
+    composite = _adaptive_boundary_blur(composite, full_mask)
 
     if match_noise:
         sigma_bg = _noise_sigma(bg)
         sigma_tgt = _noise_sigma(matched)
-        composite = inject_matching_noise(composite, full_mask, sigma_bg, sigma_tgt, rng)
+        composite = inject_matching_noise(
+            composite, full_mask, sigma_bg, sigma_tgt, rng
+        )
         radi_info["sigma_bg"] = sigma_bg
         radi_info["sigma_tgt"] = sigma_tgt
 
@@ -580,11 +1012,122 @@ def paste_target(
         composite=composite,
         bg=bg,
         target_patch=matched,
-        mask_patch=m,
+        mask_patch=mask,
         paste_xy=(x, y),
         method=method,
         bg_view=bg_view,
-        target_on_horizon=on_horizon,
-        sim_horizon_row=sim_hr,
+        target_on_horizon=target_on_horizon,
+        sim_horizon_row=None,
         radiometric=radi_info,
+        notes=notes,
     )
+
+
+# --------------------------------------------------------------------------- #
+# paste_target — high-level entry point (sample → mask → bg)
+# --------------------------------------------------------------------------- #
+
+
+def paste_target(
+    sample: Sample,
+    mask: np.ndarray,
+    bg: np.ndarray,
+    *,
+    method: BlendMethod = "laplacian",
+    bg_view: Optional[BackgroundView] = None,
+    bg_path: Optional["str | Path"] = None,
+    target_on_horizon: Optional[bool] = None,
+    match_noise: bool = True,
+    tv_smooth: bool = False,
+    rng: Optional[np.random.Generator] = None,
+    # --- augmentation / alignment ---
+    augment_bg: bool = False,
+    bg_scale_range: tuple[float, float] = (1.0, 1.4),
+    align_to_horizon: bool = False,
+    # --- ship size control ---
+    ship_scale_range: tuple[float, float] = (0.55, 0.90),
+    # --- multi-ship overlap avoidance ---
+    occupied_mask: Optional[np.ndarray] = None,
+) -> PasteResult:
+    """High-level: extract target, match radiometry, blend into bg.
+
+    Default is ``method="laplacian"``. For the lowest seam gradient,
+    enable ``tv_smooth=True`` (≈ 23 % below plain alpha) while preserving
+    IR radiometric contrast. Use ``method="alpha"`` for the fastest path,
+    or ``method="poisson"`` only when the source target has strong
+    internal texture you want to preserve (Poisson's mean-retargeting
+    will otherwise wash out low-texture IR ships).
+
+    Placement is view-aware:
+
+    * side-view bg + target on sim horizon → bottom flush with bg horizon.
+    * side-view bg + target below sim horizon → entirely in the ocean.
+    * top-down bg → anywhere inside the frame.
+
+    ``target_on_horizon`` is auto-detected from the sim image when None.
+
+    Additional augmentation parameters
+    ------------------------------------
+    augment_bg
+        If ``True``, the background is randomly zoomed-in by a factor
+        drawn uniformly from *bg_scale_range* and then smart-cropped
+        back to its original resolution (prefers clean, horizon-stable
+        crop windows).  ``bg_view`` is re-computed on the augmented
+        frame.  Simulates different sensor zoom levels.
+    bg_scale_range
+        ``(lo, hi)`` for the zoom factor; recommended ``(1.0, 1.4)``.
+    align_to_horizon
+        If ``True`` **and** the background is side-view, the target
+        patch is rotated so its principal (long) axis becomes parallel
+        to the local background horizon.  This enforces the physical
+        constraint that a ship floating on water has its keel horizontal
+        with respect to the sea-sky line.  Has no effect on top-down
+        backgrounds (ship heading is arbitrary in nadir view).
+    ship_scale_range
+        ``(lo, hi)`` for the random ship downscale factor applied
+        *before* pasting.  Default ``(0.55, 0.90)`` shrinks the target
+        to 55–90 % of its original size, simulating greater viewing
+        distances.  Set to ``(1.0, 1.0)`` to disable.  Ships on the
+        horizon are placed with their bottom edge aligned to the horizon
+        after scaling.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    notes: list[str] = []
+
+    # --- Optional background augmentation ---
+    if augment_bg:
+        bg = augment_background(bg, rng, scale_range=bg_scale_range)
+        bg_view = None
+        notes.append(f"bg augmented scale in {bg_scale_range}")
+
+    if bg_view is None:
+        _fname = Path(bg_path).name if bg_path is not None else None
+        bg_view = classify_background(bg, return_info=True, filename=_fname)
+
+    if target_on_horizon is None:
+        on_horizon, sim_hr = detect_target_on_horizon(sample, mask)
+    else:
+        on_horizon = bool(target_on_horizon)
+        _, sim_hr = detect_target_on_horizon(sample, mask)
+
+    patch, m, _ = target_patch_from_sample(sample, mask)
+
+    pr = paste_patch(
+        patch,
+        m,
+        bg,
+        method=method,
+        bg_view=bg_view,
+        target_on_horizon=on_horizon,
+        match_noise=match_noise,
+        tv_smooth=tv_smooth,
+        rng=rng,
+        align_to_horizon=align_to_horizon,
+        ship_scale_range=ship_scale_range,
+        occupied_mask=occupied_mask,
+    )
+    pr.sim_horizon_row = sim_hr
+    pr.notes = notes + pr.notes
+    return pr

@@ -48,7 +48,9 @@ class Annotation:
     image_width: int
     image_height: int
 
-    def bbox_xyxy(self, expand: float = 0.0, clip: bool = True) -> tuple[int, int, int, int]:
+    def bbox_xyxy(
+        self, expand: float = 0.0, clip: bool = True
+    ) -> tuple[int, int, int, int]:
         """Return ``(x0, y0, x1, y1)`` bbox, optionally expanded by
         ``expand`` (fraction, e.g. ``0.05`` for +5 %)."""
         w = self.width * (1.0 + expand)
@@ -63,7 +65,12 @@ class Annotation:
             x1 = min(self.image_width, int(np.ceil(x1)))
             y1 = min(self.image_height, int(np.ceil(y1)))
         else:
-            x0, y0, x1, y1 = int(np.floor(x0)), int(np.floor(y0)), int(np.ceil(x1)), int(np.ceil(y1))
+            x0, y0, x1, y1 = (
+                int(np.floor(x0)),
+                int(np.floor(y0)),
+                int(np.ceil(x1)),
+                int(np.ceil(y1)),
+            )
         return x0, y0, x1, y1
 
     def corners_pixel(self) -> Optional[np.ndarray]:
@@ -111,7 +118,7 @@ class Annotation:
             y0 -= h * expand / 2.0
             y1 += h * expand / 2.0
         x0i, y0i = int(np.floor(x0)), int(np.floor(y0))
-        x1i, y1i = int(np.ceil(x1)),  int(np.ceil(y1))
+        x1i, y1i = int(np.ceil(x1)), int(np.ceil(y1))
         if clip:
             x0i = max(0, x0i)
             y0i = max(0, y0i)
@@ -233,7 +240,8 @@ def _read_preview(stem: Path) -> Optional[np.ndarray]:
         p = stem.with_name(stem.name + ext)
         if not p.exists():
             continue
-        img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+        buf = np.fromfile(str(p), dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
         if img is None:
             continue
         if img.ndim == 2:
