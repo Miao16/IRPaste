@@ -287,8 +287,12 @@ def main() -> int:
                     help="upper bound of background zoom-in factor")
     ap.add_argument("--align-axis", action="store_true",
                     help="rotate ship principal axis parallel to bg horizon")
-    ap.add_argument("--ship-scale-min", type=float, default=0.55)
-    ap.add_argument("--ship-scale-max", type=float, default=0.90)
+    ap.add_argument("--ship-scale-min", type=float, default=0.55,
+                    help="min downscale for large ships (more shrinking)")
+    ap.add_argument("--ship-scale-max", type=float, default=0.90,
+                    help="max downscale for small ships (kept larger)")
+    ap.add_argument("--max-bbox-px", type=int, default=None,
+                    help="clamp longest bbox side to N pixels (e.g. 125)")
     ap.add_argument("--max-ships-per-bg", type=int, default=1,
                     help="max ships per background (1-5)")
     args = ap.parse_args()
@@ -443,6 +447,7 @@ def main() -> int:
                         rng=np.random.default_rng(seed + 1000 + produced + i),
                         align_to_horizon=args.align_axis,
                         ship_scale_range=(args.ship_scale_min, args.ship_scale_max),
+                        max_bbox_px=args.max_bbox_px,
                         occupied_mask=occupied_mask if i > 0 else None,
                     )
                 except Exception as e:

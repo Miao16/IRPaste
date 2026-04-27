@@ -43,7 +43,7 @@ Four modules exposing a pipeline: **load sample → extract mask → paste onto 
 
 **`paste.py`** — Compositing (`paste_target`):
 - Background zoom augmentation (`augment_background`) with smart crop scoring
-- Ship downscaling (`ship_scale_range`, default 0.55–0.90)
+- Size-dependent ship downscaling (`ship_scale_range`, default 0.55–0.90): large ships shrink more, small ships stay closer to original size; optional `max_bbox_px` caps longest side
 - Optional principal-axis/horizon alignment (`align_to_horizon`) via PCA angle + rotation
 - View-aware paste-site selection: side-view ships placed near/below horizon; top-down ships anywhere
 - Radiometric matching: shift target mean to `bg_med + Δ` preserving thermal polarity; contrast clamp at 8× bg_std
@@ -67,5 +67,5 @@ Four modules exposing a pipeline: **load sample → extract mask → paste onto 
 - **Chinese path support**: Use `np.fromfile()` + `cv2.imdecode()` for reading, never `cv2.imread()`.
 - **Blend default**: `laplacian` + `tv_smooth=True` — lowest seam gradient (~23% below plain alpha) while preserving IR radiometric contrast.
 - **No pixel-level overlap avoidance** — each paste_target call handles one ship. Multi-ship compositing would need external orchestration.
-- **ship_scale_range** default is (0.55, 0.90) — ships are *downscaled* to simulate distance. In contrast, ship_paste_project uses upscaling (1.15–1.65) for visibility.
+- **ship_scale_range** default is (0.55, 0.90) — ships are *downscaled* to simulate distance, with size-dependent mapping: large ships get smaller multipliers (more shrinking), small ships get larger multipliers (stay visible). In contrast, ship_paste_project uses upscaling (1.15–1.65) for visibility.
 - **Output size** is always 512×512 (cropped from the background, not the target).

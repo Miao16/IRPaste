@@ -130,8 +130,12 @@ def main() -> None:
     ap.add_argument(
         "--n-pairs", type=int, default=3, help="number of composites to generate"
     )
-    ap.add_argument("--ship-scale-min", type=float, default=0.55)
-    ap.add_argument("--ship-scale-max", type=float, default=0.90)
+    ap.add_argument("--ship-scale-min", type=float, default=0.55,
+                    help="min downscale for large ships (more shrinking)")
+    ap.add_argument("--ship-scale-max", type=float, default=0.90,
+                    help="max downscale for small ships (kept larger)")
+    ap.add_argument("--max-bbox-px", type=int, default=None,
+                    help="clamp longest bbox side to N pixels (e.g. 125)")
     ap.add_argument(
         "--bg-scale-max",
         type=float,
@@ -201,6 +205,7 @@ def main() -> None:
                 bg_scale_range=(1.0, args.bg_scale_max),
                 align_to_horizon=args.align_axis,
                 ship_scale_range=(args.ship_scale_min, args.ship_scale_max),
+                max_bbox_px=args.max_bbox_px,
                 blend_mode=args.blend_mode,
             )
             print(

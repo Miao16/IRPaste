@@ -112,8 +112,9 @@ outputs/_bulk/
 | `--side-frac` | 0.80 | 侧视图占比 |
 | `--augment-bg` | False | 随机放大 + 智能裁剪背景 |
 | `--bg-scale-max` | 1.3 | 背景放大上限 |
-| `--ship-scale-min` | 0.55 | 舰船缩小下限 |
-| `--ship-scale-max` | 0.90 | 舰船缩小上限 |
+| `--ship-scale-min` | 0.55 | 大船缩小倍率（更大的缩小） |
+| `--ship-scale-max` | 0.90 | 小船缩小倍率（保持较大） |
+| `--max-bbox-px` | — | 限制 bbox 最长边像素数（如 125） |
 | `--align-axis` | False | 舰船主轴对齐海天线（侧视） |
 
 ---

@@ -859,6 +859,47 @@ def rotate_patch_to_angle(
 
 
 # --------------------------------------------------------------------------- #
+# Size-dependent ship downscale
+# --------------------------------------------------------------------------- #
+
+
+def _ship_scale_from_area(
+    mask_area: int,
+    scale_range: tuple[float, float],
+    ref_area: float = 3000.0,
+    sensitivity: float = 1.2,
+    rng: "np.random.Generator | None" = None,
+) -> float:
+    """Compute a size-dependent ship downscale factor.
+
+    Large ships (area > *ref_area*) receive a scale closer to
+    ``scale_range[0]`` (more downscaling).  Small ships (area < *ref_area*)
+    receive a scale closer to ``scale_range[1]`` (less downscaling, keeping
+    them visible).
+
+    The mapping uses a sigmoid over the log-area ratio so it behaves
+    smoothly across orders of magnitude.  A small random jitter (±4 % of
+    the range) preserves natural variation.
+    """
+    lo, hi = scale_range
+    if lo >= hi:
+        return float(lo)
+
+    area = max(mask_area, 1)
+    log_ratio = np.log(area / ref_area)
+    # t → 0 for large ships, t → 1 for small ships
+    t = 1.0 / (1.0 + np.exp(sensitivity * log_ratio))
+    base = lo + t * (hi - lo)
+
+    # Small random jitter (±4 % of range) for natural variation.
+    if rng is not None:
+        jitter = float(rng.uniform(-0.04, 0.04)) * (hi - lo)
+        base = float(np.clip(base + jitter, lo, hi))
+
+    return float(base)
+
+
+# --------------------------------------------------------------------------- #
 # paste_patch — low-level entry point for pre-tight-cropped targets
 # --------------------------------------------------------------------------- #
 
@@ -876,6 +917,7 @@ def paste_patch(
     rng: Optional[np.random.Generator] = None,
     align_to_horizon: bool = False,
     ship_scale_range: tuple[float, float] = (0.55, 0.90),
+    max_bbox_px: Optional[int] = None,
     occupied_mask: Optional[np.ndarray] = None,
 ) -> PasteResult:
     """Paste a pre-cropped (patch, mask) pair onto a background.
@@ -931,12 +973,12 @@ def paste_patch(
                 f"horizon={horizon_angle:.1f}deg rot={rotation:.1f}deg"
             )
 
-    # --- Optional ship downscale ---
-    s_lo, s_hi = ship_scale_range
-    if s_lo < s_hi:
-        ship_scale = float(rng.uniform(s_lo, s_hi))
-    else:
-        ship_scale = float(s_lo)
+    # --- Optional ship downscale (size-dependent) ---
+    # Large ships → smaller multiplier (more downscaling).
+    # Small ships → larger multiplier (less downscaling, stay visible).
+    ship_scale = _ship_scale_from_area(
+        int(mask.sum()), ship_scale_range, rng=rng,
+    )
     if ship_scale < 0.99:
         new_pw = max(4, int(round(pw * ship_scale)))
         new_ph = max(4, int(round(ph * ship_scale)))
@@ -957,6 +999,21 @@ def paste_patch(
         patch = patch[_y0c:_y1c, _x0c:_x1c]
         mask = mask[_y0c:_y1c, _x0c:_x1c]
         ph, pw = patch.shape
+
+    # --- Optional bbox max-side clamp ---
+    # Ensure the longest side of the tight bounding box does not exceed
+    # *max_bbox_px* pixels (e.g. 125).  Applied after tight-crop so the
+    # measurement reflects the actual ship silhouette.
+    if max_bbox_px is not None and max(pw, ph) > max_bbox_px:
+        clamp_scale = max_bbox_px / max(pw, ph)
+        new_pw = max(4, int(round(pw * clamp_scale)))
+        new_ph = max(4, int(round(ph * clamp_scale)))
+        patch = cv2.resize(patch, (new_pw, new_ph), interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(
+            mask.astype(np.uint8), (new_pw, new_ph), interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
+        ph, pw = patch.shape
+        notes.append(f"bbox clamp max={max_bbox_px}px -> {pw}x{ph}")
 
     x, y = choose_paste_site(
         bg, bg_view, (pw, ph), rng, target_on_horizon=target_on_horizon,
@@ -1046,6 +1103,7 @@ def paste_target(
     align_to_horizon: bool = False,
     # --- ship size control ---
     ship_scale_range: tuple[float, float] = (0.55, 0.90),
+    max_bbox_px: Optional[int] = None,
     # --- multi-ship overlap avoidance ---
     occupied_mask: Optional[np.ndarray] = None,
 ) -> PasteResult:
@@ -1084,12 +1142,19 @@ def paste_target(
         with respect to the sea-sky line.  Has no effect on top-down
         backgrounds (ship heading is arbitrary in nadir view).
     ship_scale_range
-        ``(lo, hi)`` for the random ship downscale factor applied
-        *before* pasting.  Default ``(0.55, 0.90)`` shrinks the target
-        to 55–90 % of its original size, simulating greater viewing
-        distances.  Set to ``(1.0, 1.0)`` to disable.  Ships on the
-        horizon are placed with their bottom edge aligned to the horizon
-        after scaling.
+        ``(lo, hi)`` for the **size-dependent** ship downscale factor.
+        *Large* ships are scaled closer to ``lo`` (more downscaling);
+        *small* ships are scaled closer to ``hi`` (kept closer to
+        original size so they remain visible).  Default ``(0.55, 0.90)``.
+        Set to ``(1.0, 1.0)`` to disable.  A small random jitter (±4 %
+        of range) is added for natural variation.  Ships on the horizon
+        are placed with their bottom edge aligned to the horizon after
+        scaling.
+    max_bbox_px
+        If set, the longest side of the ship's tight bounding box is
+        clamped to this pixel count (e.g. ``125``).  Applied after the
+        size-dependent scaling and tight-crop, so small ships already
+        below the limit are unaffected.
     """
     if rng is None:
         rng = np.random.default_rng()
@@ -1126,6 +1191,7 @@ def paste_target(
         rng=rng,
         align_to_horizon=align_to_horizon,
         ship_scale_range=ship_scale_range,
+        max_bbox_px=max_bbox_px,
         occupied_mask=occupied_mask,
     )
     pr.sim_horizon_row = sim_hr
