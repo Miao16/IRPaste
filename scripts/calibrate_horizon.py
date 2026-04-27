@@ -83,18 +83,30 @@ def _save_skip_set(bg_root: Path, skip_set: set[str]) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _load_progress(bg_root: Path) -> int:
+def _load_progress(bg_root: Path) -> Optional[str]:
     prog_path = bg_root / "_progress.json"
     if not prog_path.exists():
-        return 0
+        return None
     with prog_path.open("r", encoding="utf-8") as f:
-        return json.load(f).get("next_index", 0)
+        return json.load(f).get("last_stem")
 
 
-def _save_progress(bg_root: Path, index: int, total: int) -> None:
+def _save_progress(bg_root: Path, last_stem: str, total: int) -> None:
     prog_path = bg_root / "_progress.json"
     with prog_path.open("w", encoding="utf-8") as f:
-        json.dump({"version": 1, "next_index": index, "total": total}, f, indent=2)
+        json.dump({"version": 1, "last_stem": last_stem, "total": total}, f, indent=2)
+
+
+def _filter_uncalibrated(all_paths: list[Path], skip_set: set[str]) -> list[Path]:
+    result = []
+    for p in all_paths:
+        stem = p.stem
+        if stem.startswith("side_") or stem.startswith("top_"):
+            continue
+        if stem in skip_set:
+            continue
+        result.append(p)
+    return result
 
 
 def _rename_log_path(bg_root: Path) -> Path:
@@ -272,7 +284,6 @@ class _State:
     curve: Optional[HorizonCurve]
     auto_curve: Optional[HorizonCurve]
     view_kind: str
-    dirty: bool
 
     def __init__(self, auto_curve, view_kind):
         self.ctrl_pts = []
@@ -280,7 +291,6 @@ class _State:
         self.curve = None
         self.auto_curve = auto_curve
         self.view_kind = view_kind
-        self.dirty = False
 
 
 def _find_near_point(pts: list[tuple[int, int]], x: int, y: int, max_dist: int = 8) -> int:
@@ -309,7 +319,6 @@ def _make_mouse_cb(state: _State, W: int):
             # Re-fit if >=3 points.
             if len(state.ctrl_pts) >= 3:
                 state.curve = _fit_quadratic(state.ctrl_pts, W)
-            state.dirty = True
 
         elif event == cv2.EVENT_RBUTTONDOWN:
             idx = _find_near_point(state.ctrl_pts, x, y, max_dist=8)
@@ -321,7 +330,6 @@ def _make_mouse_cb(state: _State, W: int):
                     state.curve = _fit_quadratic(state.ctrl_pts, W)
                 else:
                     state.curve = None
-                state.dirty = True
 
     return on_mouse
 
@@ -347,22 +355,23 @@ def main() -> int:
     skip_set = _load_skip_set(bg_root)
 
     # Filter out already-renamed files (already calibrated) and skipped files.
-    uncalibrated = []
-    for p in all_paths:
-        stem = p.stem
-        if stem.startswith("side_") or stem.startswith("top_"):
-            continue  # already done
-        if stem in skip_set:
-            continue  # user already skipped
-        uncalibrated.append(p)
+    uncalibrated = _filter_uncalibrated(all_paths, skip_set)
 
     total = len(uncalibrated)
     if total == 0:
         print("All images are already calibrated or skipped.")
         return 0
 
-    start_idx = _load_progress(bg_root) if args.start is None else args.start
-    start_idx = max(0, min(start_idx, total - 1))
+    if args.start is not None:
+        start_idx = max(0, min(args.start, total - 1))
+    else:
+        last_stem = _load_progress(bg_root)
+        start_idx = 0
+        if last_stem is not None:
+            for i, p in enumerate(uncalibrated):
+                if p.stem == last_stem:
+                    start_idx = i
+                    break
 
     print(f"Found {total} uncalibrated images. Starting at #{start_idx + 1}.")
     print("Controls: S=save  D=skip  T=toggle view  R=reset  C=clear  P=prev  Q=quit")
@@ -383,7 +392,7 @@ def main() -> int:
             skip_set.add(image_path.stem)
             _save_skip_set(bg_root, skip_set)
             idx += 1
-            _save_progress(bg_root, idx, total)
+            _save_progress(bg_root, image_path.stem, total)
             continue
 
         H, W = bg.shape[:2]
@@ -418,7 +427,7 @@ def main() -> int:
             key = cv2.waitKey(0) & 0xFF
 
             if key == ord("q") or key == 27:  # q or Esc
-                _save_progress(bg_root, idx, total)
+                _save_progress(bg_root, image_path.stem, total)
                 print(f"\nProgress saved at {idx + 1}/{total}. Bye.")
                 cv2.destroyAllWindows()
                 return 0
@@ -430,7 +439,7 @@ def main() -> int:
                 )
                 print(f"  Saved -> {new_path.name}")
                 idx += 1
-                _save_progress(bg_root, idx, total)
+                _save_progress(bg_root, image_path.stem, total)
                 break
 
             elif key == ord("d"):
@@ -438,33 +447,34 @@ def main() -> int:
                 _save_skip_set(bg_root, skip_set)
                 print(f"  Skipped -> {image_path.name} (added to _skip.json)")
                 idx += 1
-                _save_progress(bg_root, idx, total)
+                _save_progress(bg_root, image_path.stem, total)
                 break
 
             elif key == ord("t"):
                 state.view_kind = "top" if state.view_kind == "side" else "side"
-                state.dirty = True
                 print(f"  View toggled -> {state.view_kind}")
 
             elif key == ord("r"):
                 state.ctrl_pts = []
                 state.curve = None
                 state.selected_idx = -1
-                state.dirty = True
                 print("  Reset to auto-computed curve")
 
             elif key == ord("c"):
                 state.ctrl_pts = []
                 state.curve = None
                 state.selected_idx = -1
-                state.dirty = True
                 print("  Cleared all control points")
 
             elif key == ord("p"):
                 if idx > 0:
-                    idx -= 1
-                    _save_progress(bg_root, idx, total)
-                    print(f"  Going back to #{idx + 1}")
+                    prev_uncalibrated = _filter_uncalibrated(all_paths, skip_set)
+                    if prev_uncalibrated:
+                        idx = min(idx - 1, len(prev_uncalibrated) - 1)
+                        uncalibrated = prev_uncalibrated
+                        total = len(uncalibrated)
+                        _save_progress(bg_root, uncalibrated[idx].stem, total)
+                        print(f"  Going back to #{idx + 1}")
                     break
 
             # Nudge selected point with hjkl (vim-style, cross-platform).
@@ -482,7 +492,6 @@ def main() -> int:
                     state.ctrl_pts[state.selected_idx] = (px, py)
                     if len(state.ctrl_pts) >= 3:
                         state.curve = _fit_quadratic(state.ctrl_pts, W)
-                    state.dirty = True
 
     cv2.destroyAllWindows()
     print(f"\nAll {total} images processed.")
