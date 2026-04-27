@@ -446,16 +446,8 @@ def classify_background(
             best_cand_y = cand_y
             break
 
-    # Filename-based override (authoritative naming convention).
-    if filename is not None:
-        stem = Path(filename).stem
-        first = stem[0] if stem else ""
-        if first.isalpha():
-            is_side = True
-            if best_cand_y is None:
-                best_cand_y = int(np.argmax(sub)) + y_lo
-        elif first.isdigit():
-            is_side = False
+    # Filename-based override removed; view classification is now driven
+    # by horizon_cache.json files (see scripts/calibrate_horizon.py).
 
     curve: Optional[HorizonCurve] = None
     horizon_row: Optional[int] = int(best_cand_y) if (is_side and best_cand_y is not None) else None
