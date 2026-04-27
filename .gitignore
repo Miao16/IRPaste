@@ -9,6 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
+# Worktrees
+.worktrees/
+
 # Local data and generated outputs
 data/
 outputs/
