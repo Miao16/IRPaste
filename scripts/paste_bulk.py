@@ -38,22 +38,42 @@ from irpaste.paste import (  # noqa: E402
     _feather_alpha,
 )
 from irpaste.viewcls import classify_background  # noqa: E402
+from irpaste.horizon_cache import load_or_compute  # noqa: E402
 
 
 _ORANGE = (0, 160, 255)
 _CYAN = (255, 255, 0)
 
 
+def _load_skip_set(bg_root: Path) -> set[str]:
+    """Load set of skipped background stems from _skip.json."""
+    skip_path = bg_root / "_skip.json"
+    if not skip_path.exists():
+        return set()
+    import json
+    with skip_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return set(data.get("skipped", []))
+
+
 def _index_bgs(root: Path):
-    """Index backgrounds by view type, caching bg_view to avoid re-classification."""
-    side_paths, top_paths = [], []
-    side_views, top_views = [], []
+    """Index backgrounds by view type from horizon cache files."""
+    skip_set = _load_skip_set(root)
+    side_paths, side_views = [], []
+    top_paths, top_views = [], []
     for p in sorted(root.iterdir()):
         if p.suffix.lower() not in {".png", ".bmp", ".jpg", ".jpeg", ".tif"}:
             continue
+        stem = p.stem
+        # Require calibrated naming scheme.
+        if not (stem.startswith("side_") or stem.startswith("top_")):
+            continue
+        if stem in skip_set:
+            continue
         try:
             bg = load_background(p)
-            v = classify_background(bg, return_info=True, filename=p.name)
+            data = load_or_compute(p, bg)
+            v = data.to_background_view()
         except Exception:
             continue
         if v.kind == "side":
