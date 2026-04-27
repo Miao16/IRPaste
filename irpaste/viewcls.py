@@ -348,18 +348,17 @@ def classify_background(
        have two distinct modes for a side-view image.
     4. Side-view iff ``step ≥ min_step`` and the sky strip is not
        excessively noisy.
-    5. Filename-based override (letter prefix → side; digit prefix → top).
-    6. If side-view and ``fit_curve``, fit the upgraded quadratic horizon
+    5. If side-view and ``fit_curve``, fit the upgraded quadratic horizon
        via the multi-scale RANSAC/LO-RANSAC procedure in
        :func:`fit_horizon_curve`.
 
     v3 improvements
     ---------------
-    7. **Multi-peak verification**: when the bottom-most gradient peak
+    6. **Multi-peak verification**: when the bottom-most gradient peak
        fails the step test, try the next-strongest peaks in ascending
        order to handle double horizons (e.g., fog layer above true
        sea-sky boundary).
-    8. **Adaptive band sizing**: scale sky/sea bands with image height
+    7. **Adaptive band sizing**: scale sky/sea bands with image height
        so that small images don't receive oversized bands that cross
        the horizon.
     """
