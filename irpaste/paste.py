@@ -476,8 +476,10 @@ def radiometric_match(
 
     # Minimum visibility guard: ensure ship deviates from background by at
     # least min_dev_factor × bg_std so it doesn’t blend into the sea.
-    min_dev = min_dev_factor * bg_std
-    if preserve_contrast and abs(new_mean - bg_med) < 0.5 * bg_std:
+    # Absolute floors prevent disappearance on very uniform backgrounds
+    # where bg_std is small (e.g. calm open water).
+    min_dev = max(min_dev_factor * bg_std, 12.0)
+    if preserve_contrast and abs(new_mean - bg_med) < max(0.5 * bg_std, 6.0):
         sign = 1.0 if delta >= 0 else -1.0
         new_mean = bg_med + sign * min_dev
 
