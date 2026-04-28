@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -164,6 +165,8 @@ def main() -> int:
     ap.add_argument("--targets-root", default="data/burkeIIA长波")
     ap.add_argument("--bg-root", default="data/background/test_1")
     ap.add_argument("--out", default="outputs/_paste")
+    ap.add_argument("--tag", default=None,
+                    help="run tag for output filenames (default: auto-timestamp)")
     ap.add_argument(
         "--n",
         type=int,
@@ -197,6 +200,36 @@ def main() -> int:
         action="store_true",
         help="rotate ship so its principal axis is parallel to the bg horizon (side-view only)",
     )
+    ap.add_argument("--contrast-boost", type=float, default=None,
+                    help="fixed contrast boost (e.g. 1.8); omit for random range")
+    ap.add_argument("--contrast-min", type=float, default=1.2,
+                    help="lower bound of contrast boost range")
+    ap.add_argument("--contrast-max", type=float, default=3.5,
+                    help="upper bound of contrast boost range")
+    ap.add_argument("--contrast-high-frac", type=float, default=0.7,
+                    help="fraction of samples using upper-half contrast range")
+    ap.add_argument("--min-dev-factor", type=float, default=1.2,
+                    help="bg_std multiplier for minimum visibility guard")
+    ap.add_argument("--min-ship-bg-ratio", type=float, default=0.4,
+                    help="minimum ship-to-bg std ratio for internal contrast")
+    ap.add_argument("--no-shadow", action="store_true",
+                    help="disable ship water-surface shadow")
+    ap.add_argument("--shadow-depth-min", type=float, default=18,
+                    help="minimum shadow darkening in grey levels")
+    ap.add_argument("--shadow-depth-max", type=float, default=50,
+                    help="maximum shadow darkening in grey levels")
+    ap.add_argument("--shadow-max-len", type=int, default=70,
+                    help="maximum shadow length in pixels")
+    ap.add_argument("--no-degrade", action="store_true",
+                    help="disable sensor degradation effects")
+    ap.add_argument("--no-augment", action="store_true",
+                    help="disable global image augmentation")
+    ap.add_argument("--align-perturb", type=float, default=5.0,
+                    help="random perturbation (±deg) added to axis alignment")
+    ap.add_argument("--side-top-ratio", type=float, default=4.0,
+                    help="ratio of side:top view composites (1=1:1 equal, 4=4:1, <1 = more top)")
+    ap.add_argument("--view", choices=["side", "top", "both"], default="both",
+                    help="restrict to a single view (default: both)")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -207,6 +240,9 @@ def main() -> int:
     out_vis.mkdir(exist_ok=True)
     out_clean.mkdir(exist_ok=True)
     out_labels.mkdir(exist_ok=True)
+
+    tag = args.tag if args.tag else datetime.now().strftime("%Y%m%d_%H%M%S")
+    print(f"run tag: {tag}")
 
     seed = (
         args.seed
@@ -249,6 +285,10 @@ def main() -> int:
                 tgt_stem, kind = next(_q_iter)
             except StopIteration:
                 break
+            if args.view == "side" and kind != "side":
+                continue
+            if args.view == "top" and kind != "top":
+                continue
             bg_pool = bg_side if kind == "side" else bg_top
             if not bg_pool:
                 continue
@@ -258,7 +298,13 @@ def main() -> int:
             attempts += 1
             if attempts > n_total * 5:
                 break
-            kind = "side" if rng.random() < 0.8 else "top"
+            if args.view == "side":
+                kind = "side"
+            elif args.view == "top":
+                kind = "top"
+            else:
+                side_frac = args.side_top_ratio / (1.0 + args.side_top_ratio)
+                kind = "side" if rng.random() < side_frac else "top"
             if kind == "side" and (not bg_side or not tgt_side):
                 kind = "top"
             if kind == "top" and (not bg_top or not tgt_top):
@@ -296,10 +342,21 @@ def main() -> int:
                     augment_bg=args.augment_bg,
                     bg_scale_range=(1.0, args.bg_scale_max),
                     align_to_horizon=args.align_axis,
+                    contrast_boost=args.contrast_boost,
+                    contrast_boost_range=(args.contrast_min, args.contrast_max),
+                    contrast_boost_high_frac=args.contrast_high_frac,
+                    min_dev_factor=args.min_dev_factor,
+                    min_ship_bg_ratio=args.min_ship_bg_ratio,
+                    render_shadow=not args.no_shadow,
+                    shadow_depth_range=(args.shadow_depth_min, args.shadow_depth_max),
+                    max_shadow_len=args.shadow_max_len,
+                    apply_degrade=not args.no_degrade,
+                    apply_augment=not args.no_augment,
+                    align_perturb=args.align_perturb if args.align_axis else 0.0,
                 )
                 panels.append(_make_panel(sample, res.mask, pr, title + f"  [{m}]"))
             stacked = np.concatenate(panels, axis=0) if len(panels) > 1 else panels[0]
-            stem = f"{produced:06d}_{kind}_{args.method}"
+            stem = f"{produced:06d}_{tag}_{kind}_{args.method}"
             # Annotated panel (sim + mask | composite + bbox/horizon)
             cv2.imwrite(str(out_vis / (stem + ".png")), stacked)
             # Clean composite — grayscale, no labels or boxes

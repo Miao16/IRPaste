@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 
 from .io_utils import Sample
+from .sensor_degrade import degrade_composite
 from .viewcls import BackgroundView, classify_background
 
 
@@ -363,17 +364,47 @@ def radiometric_match(
     bg_med: float,
     bg_std: float,
     preserve_contrast: bool = True,
+    contrast_boost: Optional[float] = None,
+    contrast_boost_range: tuple[float, float] = (1.2, 3.5),
+    contrast_boost_high_frac: float = 0.7,
+    min_dev_factor: float = 1.2,
+    min_ship_bg_ratio: float = 0.4,
+    rng: Optional[np.random.Generator] = None,
 ) -> tuple[np.ndarray, dict]:
     """Shift (and optionally scale) target radiance to fit the local bg.
 
-    * Target's masked mean is moved to ``bg_med + Δ``, where Δ is the
-      target-minus-bg mean offset *before* shift (preserves thermal
-      polarity — a hot ship stays hotter than water).
-    * Un-masked (surrounding) pixels in the patch are moved by the same
-      global shift so the patch remains self-consistent.
-    * Optional contrast clamp: if the target's intra-mask std exceeds
-      ``3 × bg_std``, rescale to ``2 × bg_std`` around the mask mean.
+    IR-radiometry-aware matching with configurable contrast enhancement:
+
+    * Target’s masked mean is moved to ``bg_med + Δ × contrast_boost``,
+      where Δ is the signed target-minus-surround offset before shift.
+      Amplifying Δ pushes the ship further from the background mean,
+      simulating a closer or more sensitive thermal sensor.
+    * If *contrast_boost* is None (default), the value is randomly sampled
+      from *contrast_boost_range* with *contrast_boost_high_frac* controlling
+      the probability of sampling from the upper portion of the range.
+    * **Minimum visibility guard**: if after shift the ship mean is
+      within ``0.5 × bg_std`` of the background median, the ship is
+      pushed to ``bg_med ± min_dev_factor × bg_std`` (preserving thermal
+      polarity) so targets stand out against the background.
+    * **Internal contrast preservation**: if the ship’s internal std
+      is below ``min_ship_bg_ratio × bg_std``, the ship histogram is
+      stretched so engine hot-spots and hull structure remain visible.
+    * Un-masked (surrounding) pixels are moved by the same global shift
+      so the patch stays self-consistent.
+    * Contrast clamp: if target intra-mask std exceeds ``8 × bg_std``,
+      rescale to ``4 × bg_std`` (reserved for simulation artefacts).
     """
+    # Randomise contrast_boost if not explicitly set.
+    if contrast_boost is None:
+        if rng is None:
+            rng = np.random.default_rng()
+        lo, hi = contrast_boost_range
+        mid = lo + (hi - lo) * (1.0 - contrast_boost_high_frac)
+        if float(rng.random()) < contrast_boost_high_frac:
+            contrast_boost = float(rng.uniform(mid, hi))
+        else:
+            contrast_boost = float(rng.uniform(lo, mid))
+
     p = patch.astype(np.float32)
     tgt_vals = p[mask]
     if tgt_vals.size == 0:
@@ -381,20 +412,38 @@ def radiometric_match(
     tgt_mean = float(tgt_vals.mean())
     tgt_std = float(tgt_vals.std() + 1e-3)
 
-    # Determine polarity: if target mean > local surround mean, keep it hotter.
+    # Determine thermal polarity: hot ship → positive delta, cold ship → negative.
     surround = p[~mask] if (~mask).any() else p.reshape(-1)
     sur_mean = float(np.median(surround))
     delta = tgt_mean - sur_mean  # signed preserved contrast
-    new_mean = bg_med + (delta if preserve_contrast else 0.0)
+
+    # Amplify thermal delta — IR ships must stand out against sea/sky.
+    if preserve_contrast:
+        delta_boosted = delta * contrast_boost
+    else:
+        delta_boosted = 0.0
+    new_mean = bg_med + delta_boosted
+
+    # Minimum visibility guard: ensure ship deviates from background by at
+    # least min_dev_factor × bg_std so it doesn’t blend into the sea.
+    min_dev = min_dev_factor * bg_std
+    if preserve_contrast and abs(new_mean - bg_med) < 0.5 * bg_std:
+        sign = 1.0 if delta >= 0 else -1.0
+        new_mean = bg_med + sign * min_dev
 
     shift = new_mean - tgt_mean
     p = p + shift
 
-    # Contrast clamp: only rescale if target is extremely over-contrasted
-    # relative to the local background.  The old threshold (3×) fired too
-    # readily on bright MWIR ships against calm-sea backgrounds, flattening
-    # the target’s internal structure into a featureless blob.  The new
-    # threshold (8×) reserves the clamp for obvious simulation artefacts.
+    # Internal contrast preservation: stretch dim ships so internal
+    # structure (engine hot-spots, hull edges) stays visible.
+    min_internal_std = min_ship_bg_ratio * bg_std
+    if tgt_std < min_internal_std:
+        scale_ic = min_internal_std / tgt_std
+        p_masked = p.copy()
+        p_masked[mask] = new_mean + (p[mask] - new_mean) * scale_ic
+        p = p_masked
+
+    # Contrast clamp for extreme simulation artefacts (very rare).
     if tgt_std > 8.0 * bg_std:
         scale = (4.0 * bg_std) / tgt_std
         p_masked = p.copy()
@@ -410,6 +459,7 @@ def radiometric_match(
         "bg_std": bg_std,
         "delta": delta,
         "shift": shift,
+        "contrast_boost": contrast_boost,
     }
     return p, info
 
@@ -451,6 +501,40 @@ def _composite_fg(
     out = bg_patch.astype(np.float32).copy()
     out[mask] = fg_patch.astype(np.float32)[mask]
     return out
+
+
+def _feather_paste_rect(
+    composite: np.ndarray,
+    bg: np.ndarray,
+    x: int, y: int, pw: int, ph: int,
+    sigma: float = 1.2,
+) -> np.ndarray:
+    """Softly blend the edges of a rectangular paste region into the background.
+
+    After pyramid-based blending, the hard rectangular boundary at
+    ``composite[y:y+ph, x:x+pw]`` may carry sub-pixel differences that become
+    visible once noise or global augmentation is applied.  A narrow 2-3 px
+    Gaussian cross-fade at the rectangle border makes the seam invisible.
+    """
+    H, W = composite.shape
+    x1 = min(x + pw, W)
+    y1 = min(y + ph, H)
+    rw = x1 - x
+    rh = y1 - y
+    if rw < 8 or rh < 8:
+        return composite
+
+    # Build a soft edge mask that is 1.0 in the interior and fades to 0 at the border.
+    edge = np.ones((rh, rw), dtype=np.float32)
+    ksz = max(3, (int(sigma * 8) | 1))
+    edge = cv2.GaussianBlur(edge, (ksz, ksz), sigmaX=sigma, borderType=cv2.BORDER_CONSTANT)
+
+    bg_crop = bg[y:y1, x:x1].astype(np.float32)
+    comp_crop = composite[y:y1, x:x1].astype(np.float32)
+    blended = comp_crop * edge + bg_crop * (1.0 - edge)
+    result = composite.copy()
+    result[y:y1, x:x1] = np.clip(blended, 0, 255).astype(np.uint8)
+    return result
 
 
 def _blend_alpha(
@@ -900,6 +984,177 @@ def _ship_scale_from_area(
 
 
 # --------------------------------------------------------------------------- #
+# Ship water-surface thermal shadow
+# --------------------------------------------------------------------------- #
+
+
+def _render_ship_shadow(
+    composite: np.ndarray,
+    full_mask: np.ndarray,
+    bg_view: BackgroundView,
+    rng: np.random.Generator,
+    shadow_depth_range: tuple[float, float] = (18, 50),
+    max_shadow_len: int = 70,
+) -> np.ndarray:
+    """Render a thermal shadow on the water surface below the ship.
+
+    The shadow is extruded from the ship's actual silhouette — each column
+    of the ship mask casts a ray downward at a randomised sun angle.  This
+    preserves the ship's outline so the shadow looks like it belongs to the
+    specific vessel rather than a generic trapezoid.
+
+    Shadow intensity fades linearly with distance from the hull so the
+    shadow looks natural rather than a hard cut-out.
+
+    Only applied for **side-view** backgrounds.
+    """
+    if bg_view.kind != "side":
+        return composite
+
+    H, W = composite.shape
+
+    # --- Per-column bottom profile of the ship mask ---
+    # bot_ys[x] = row of the lowest mask pixel in column x (H if no mask)
+    bot_ys = np.full(W, H, dtype=np.int32)
+    col_has_ship = np.any(full_mask, axis=0)
+    if not col_has_ship.any():
+        return composite
+
+    for x in np.where(col_has_ship)[0]:
+        hit = np.where(full_mask[:, x])[0]
+        bot_ys[x] = hit[-1]
+
+    x_min = int(np.where(col_has_ship)[0][0])
+    x_max = int(np.where(col_has_ship)[0][-1])
+    y_bot_max = int(bot_ys[col_has_ship].max())
+    y_bot_min = int(bot_ys[col_has_ship].min())
+    ship_h = y_bot_max - y_bot_min + 1
+
+    # --- Randomised sun geometry, capped ---
+    sun_angle = float(rng.uniform(-35.0, 35.0))        # degrees from vertical
+    raw_len = int(ship_h * float(rng.uniform(0.4, 1.6)) + 6)
+    shadow_len = min(raw_len, max_shadow_len,
+                     H - y_bot_max - 1)
+    shadow_len = max(6, shadow_len)
+
+    # --- Build shadow mask with distance-based fading gradient ---
+    shadow_mask = np.zeros((H, W), dtype=np.float32)
+
+    for x in range(x_min, x_max + 1):
+        if bot_ys[x] >= H:
+            continue
+        y0 = bot_ys[x] + 1           # one pixel below the ship hull
+        if y0 >= H:
+            continue
+        # Horizontal drift for this column at full shadow length
+        dx_total = int(shadow_len * np.tan(np.radians(sun_angle)))
+        for dy in range(1, shadow_len + 1):
+            sy = y0 + dy - 1
+            if sy >= H:
+                break
+            # Linear fade: 1.0 at dy=1 → 0.0 at dy=shadow_len
+            alpha = 1.0 - float(dy) / float(shadow_len)
+            sx = x + int(dx_total * dy / shadow_len)
+            if 0 <= sx < W:
+                # Take max so the darkest projection wins at each pixel
+                if alpha > shadow_mask[sy, sx]:
+                    shadow_mask[sy, sx] = alpha
+
+    if shadow_mask.max() < 0.01:
+        return composite
+
+    # --- Soften edges ---
+    sigma = float(rng.uniform(1.5, 3.5))
+    ksz = max(3, (int(sigma * 6) | 1))
+    shadow_mask = cv2.GaussianBlur(shadow_mask, (ksz, ksz), sigmaX=sigma)
+
+    # Do not darken the ship itself
+    shadow_mask[full_mask] = 0.0
+
+    # --- Apply darkening ---
+    depth = float(rng.uniform(*shadow_depth_range))
+    result = composite.astype(np.float32)
+    result -= shadow_mask * depth
+    np.clip(result, 0.0, 255.0, out=result)
+
+    return result.astype(np.uint8)
+
+
+# --------------------------------------------------------------------------- #
+# Global image augmentation
+# --------------------------------------------------------------------------- #
+
+
+def augment_composite(
+    img: np.ndarray,
+    rng: np.random.Generator | None = None,
+    *,
+    p_brightness: float = 0.7,
+    p_gamma: float = 0.4,
+    p_saltpepper: float = 0.15,
+) -> np.ndarray:
+    """Apply random brightness/contrast/gamma/noise jitter to a composite.
+
+    This injects the kind of sample-to-sample variation that a real IR
+    sensor produces naturally (gain drift, AGC fluctuations, instantaneous
+    noise spikes) so the detector sees a diverse training set.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        uint8 grayscale composite.
+    rng : np.random.Generator or None
+    p_brightness : float
+        Probability of brightness/contrast jitter.
+    p_gamma : float
+        Probability of gamma adjustment.
+    p_saltpepper : float
+        Probability of salt-and-pepper noise.
+
+    Returns
+    -------
+    np.ndarray
+        uint8 augmented image.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    result = img.astype(np.float32)
+
+    if rng.random() < p_brightness:
+        alpha = float(rng.uniform(0.85, 1.20))
+        beta = float(rng.uniform(-20.0, 20.0))
+        result = result * alpha + beta
+
+    if rng.random() < p_gamma:
+        gamma = float(rng.uniform(0.75, 1.35))
+        # Build lookup table for speed
+        lut = ((np.arange(256) / 255.0) ** gamma * 255.0).astype(np.float32)
+        # Clip to valid range before LUT lookup
+        clipped = np.clip(result, 0.0, 255.0).astype(np.uint8)
+        result = lut[clipped]
+
+    if rng.random() < p_saltpepper:
+        frac = float(rng.uniform(0.0001, 0.0005))
+        H, W = result.shape[:2]
+        n = max(1, int(H * W * frac))
+        ys = rng.integers(0, H, size=n)
+        xs = rng.integers(0, W, size=n)
+        result = np.clip(result, 0.0, 255.0)
+        for i in range(n):
+            local = float(result[ys[i], xs[i]])
+            if rng.random() < 0.5:
+                # Dark flicker — moderately below local
+                result[ys[i], xs[i]] = max(0.0, local - float(rng.uniform(20, 60)))
+            else:
+                # Bright flicker — moderately above local
+                result[ys[i], xs[i]] = min(255.0, local + float(rng.uniform(20, 60)))
+
+    np.clip(result, 0.0, 255.0, out=result)
+    return result.astype(np.uint8)
+
+
+# --------------------------------------------------------------------------- #
 # paste_patch — low-level entry point for pre-tight-cropped targets
 # --------------------------------------------------------------------------- #
 
@@ -919,6 +1174,17 @@ def paste_patch(
     ship_scale_range: tuple[float, float] = (0.55, 0.90),
     max_bbox_px: Optional[int] = None,
     occupied_mask: Optional[np.ndarray] = None,
+    contrast_boost: Optional[float] = None,
+    contrast_boost_range: tuple[float, float] = (1.2, 3.5),
+    contrast_boost_high_frac: float = 0.7,
+    min_dev_factor: float = 1.2,
+    min_ship_bg_ratio: float = 0.4,
+    render_shadow: bool = True,
+    shadow_depth_range: tuple[float, float] = (18, 50),
+    max_shadow_len: int = 70,
+    apply_degrade: bool = True,
+    apply_augment: bool = True,
+    align_perturb: float = 0.0,
 ) -> PasteResult:
     """Paste a pre-cropped (patch, mask) pair onto a background.
 
@@ -965,12 +1231,16 @@ def paste_patch(
         principal_angle = get_mask_principal_angle(mask)
         horizon_angle = get_horizon_tangent_angle(bg_view, W / 2.0)
         rotation = horizon_angle - principal_angle
+        # Apply random perturbation so ships are not perfectly parallel
+        if align_perturb > 0:
+            rotation += float(rng.uniform(-align_perturb, align_perturb))
         if abs(rotation) >= 0.3:
             patch, mask = rotate_patch_to_angle(patch, mask, rotation)
             ph, pw = patch.shape
             notes.append(
                 f"axis-align: principal={principal_angle:.1f}deg "
                 f"horizon={horizon_angle:.1f}deg rot={rotation:.1f}deg"
+                + (f" perturb={align_perturb:.1f}" if align_perturb > 0 else "")
             )
 
     # --- Optional ship downscale (size-dependent) ---
@@ -1029,7 +1299,13 @@ def paste_patch(
 
     bg_med, bg_std = _bg_ring_stats(bg, x, y, pw, ph, ring=max(5, min(pw, ph) // 2))
     matched, radi_info = radiometric_match(
-        patch, mask, bg_med, bg_std, preserve_contrast=True
+        patch, mask, bg_med, bg_std, preserve_contrast=True,
+        contrast_boost=contrast_boost,
+        contrast_boost_range=contrast_boost_range,
+        contrast_boost_high_frac=contrast_boost_high_frac,
+        min_dev_factor=min_dev_factor,
+        min_ship_bg_ratio=min_ship_bg_ratio,
+        rng=rng,
     )
 
     if method == "poisson":
@@ -1051,7 +1327,17 @@ def paste_patch(
     full_mask = np.zeros(bg.shape, dtype=bool)
     full_mask[y : y + ph, x : x + pw] = mask
 
+    # Feather the paste-rectangle boundary so the rectangular patch edge
+    # is invisible even after downstream noise / augmentation.
+    composite = _feather_paste_rect(composite, bg, x, y, pw, ph)
+
     composite = _adaptive_boundary_blur(composite, full_mask)
+
+    if render_shadow and bg_view.kind == "side":
+        composite = _render_ship_shadow(
+            composite, full_mask, bg_view, rng, shadow_depth_range,
+            max_shadow_len,
+        )
 
     if match_noise:
         sigma_bg = _noise_sigma(bg)
@@ -1064,6 +1350,12 @@ def paste_patch(
 
     if tv_smooth:
         composite = tv_boundary_smooth(composite, full_mask, band_px=2, weight=0.08)
+
+    if apply_degrade:
+        composite = degrade_composite(composite, rng)
+
+    if apply_augment:
+        composite = augment_composite(composite, rng)
 
     return PasteResult(
         composite=composite,
@@ -1106,6 +1398,22 @@ def paste_target(
     max_bbox_px: Optional[int] = None,
     # --- multi-ship overlap avoidance ---
     occupied_mask: Optional[np.ndarray] = None,
+    # --- contrast control ---
+    contrast_boost: Optional[float] = None,
+    contrast_boost_range: tuple[float, float] = (1.2, 3.5),
+    contrast_boost_high_frac: float = 0.7,
+    min_dev_factor: float = 1.2,
+    min_ship_bg_ratio: float = 0.4,
+    # --- shadow ---
+    render_shadow: bool = True,
+    shadow_depth_range: tuple[float, float] = (18, 50),
+    max_shadow_len: int = 70,
+    # --- sensor degradation ---
+    apply_degrade: bool = True,
+    # --- global augmentation ---
+    apply_augment: bool = True,
+    # --- axis alignment ---
+    align_perturb: float = 0.0,
 ) -> PasteResult:
     """High-level: extract target, match radiometry, blend into bg.
 
@@ -1193,6 +1501,17 @@ def paste_target(
         ship_scale_range=ship_scale_range,
         max_bbox_px=max_bbox_px,
         occupied_mask=occupied_mask,
+        contrast_boost=contrast_boost,
+        contrast_boost_range=contrast_boost_range,
+        contrast_boost_high_frac=contrast_boost_high_frac,
+        min_dev_factor=min_dev_factor,
+        min_ship_bg_ratio=min_ship_bg_ratio,
+        render_shadow=render_shadow,
+        shadow_depth_range=shadow_depth_range,
+        max_shadow_len=max_shadow_len,
+        apply_degrade=apply_degrade,
+        apply_augment=apply_augment,
+        align_perturb=align_perturb,
     )
     pr.sim_horizon_row = sim_hr
     pr.notes = notes + pr.notes
