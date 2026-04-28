@@ -4,7 +4,12 @@
       "Bash(echo \"---EXIT:$?---\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('irpaste/viewcls.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(uv run:*)",
-      "Bash(git ls-tree:*)"
+      "Bash(git ls-tree:*)",
+      "Bash(python:*)",
+      "Bash(xxd)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ]
   }
 }
