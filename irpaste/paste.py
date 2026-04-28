@@ -235,7 +235,7 @@ def choose_paste_site(
         region = occupied_mask[yy : yy + ph, xx : xx + pw]
         if region.size == 0:
             return False
-        return float(region.mean()) < 0.08  # < 8 % overlap is OK
+        return float(region.mean()) < 0.03  # < 3 % overlap is OK
 
     # -- Side-view bg --------------------------------------------------
     if bg_view.kind == "side" and bg_view.horizon_row is not None:
@@ -288,27 +288,66 @@ def choose_paste_site(
                 if _overlap_ok(x, y_candidate):
                     return x, y_candidate
 
-        # No overlap-free site found after retries — accept best-effort
-        # but still honour horizon constraints.
-        if len(valid_x_sorted) > 1:
-            idx = _center_biased_int(rng, 0, len(valid_x_sorted) - 1, bias=2.0)
-            x = int(valid_x_sorted[idx])
-        else:
-            x = int(valid_x_sorted[0])
-        hr_local = _horizon_at(bg_view, x + pw / 2.0, horizon_mid)
-        if target_on_horizon:
-            min_sea_rows = max(4, ph // 3)
-            jitter = int(rng.integers(-2, 3))
-            y_ideal = hr_local - (ph - min_sea_rows) + jitter
-            y = int(np.clip(y_ideal, y_lo, y_hi))
-            return x, y
-        buffer = max(2, ph // 8)
-        y_sea_lo = min(y_hi, max(y_lo, hr_local + buffer))
-        if y_sea_lo < y_hi:
-            y = _center_biased_int(rng, y_sea_lo, y_hi, bias=2.0)
-        else:
-            y = y_sea_lo
-        return x, max(y_lo, y)
+        # No overlap-free site found after retries — keep trying with
+        # overlap checks, but relax the threshold gradually.
+        for threshold in (0.03, 0.08, 0.15):
+            for _ in range(max_retry // 2):
+                if len(valid_x_sorted) > 1:
+                    idx = _center_biased_int(rng, 0, len(valid_x_sorted) - 1, bias=2.0)
+                    x = int(valid_x_sorted[idx])
+                else:
+                    x = int(valid_x_sorted[0])
+                hr_local = _horizon_at(bg_view, x + pw / 2.0, horizon_mid)
+                if target_on_horizon:
+                    min_sea_rows = max(4, ph // 3)
+                    jitter = int(rng.integers(-2, 3))
+                    y_ideal = hr_local - (ph - min_sea_rows) + jitter
+                    y_candidate = int(np.clip(y_ideal, y_lo, y_hi))
+                else:
+                    buf = max(2, ph // 8)
+                    y_sea_lo = min(y_hi, max(y_lo, hr_local + buf))
+                    y_candidate = (
+                        _center_biased_int(rng, y_sea_lo, y_hi, bias=2.0)
+                        if y_sea_lo < y_hi
+                        else y_sea_lo
+                    )
+                if occupied_mask is None or not occupied_mask.any():
+                    return x, y_candidate
+                region = occupied_mask[y_candidate:y_candidate + ph, x:x + pw]
+                if region.size == 0:
+                    return x, y_candidate
+                if float(region.mean()) < threshold:
+                    return x, y_candidate
+        # Last resort: pick the position with the least overlap among a few
+        # random candidates, or a hard-coded centre position.
+        best_x, best_y, best_overlap = x_lo, y_lo, 1.0
+        for _ in range(max_retry):
+            if len(valid_x_sorted) > 1:
+                idx = _center_biased_int(rng, 0, len(valid_x_sorted) - 1, bias=2.0)
+                cx = int(valid_x_sorted[idx])
+            else:
+                cx = int(valid_x_sorted[0])
+            hr_local = _horizon_at(bg_view, cx + pw / 2.0, horizon_mid)
+            if target_on_horizon:
+                min_sea_rows = max(4, ph // 3)
+                cy = int(np.clip(hr_local - (ph - min_sea_rows), y_lo, y_hi))
+            else:
+                buf = max(2, ph // 8)
+                y_sea_lo = min(y_hi, max(y_lo, hr_local + buf))
+                cy = (
+                    _center_biased_int(rng, y_sea_lo, y_hi, bias=2.0)
+                    if y_sea_lo < y_hi
+                    else y_sea_lo
+                )
+            if occupied_mask is None or not occupied_mask.any():
+                return cx, cy
+            region = occupied_mask[cy:cy + ph, cx:cx + pw]
+            if region.size == 0:
+                return cx, cy
+            ov = float(region.mean())
+            if ov < best_overlap:
+                best_overlap, best_x, best_y = ov, cx, cy
+        return best_x, best_y
 
     # -- Top-down bg — center-biased, try to avoid overlap, then accept best-effort
     for _ in range(max_retry):
@@ -325,11 +364,22 @@ def choose_paste_site(
         region = occupied_mask[y : y + ph, x : x + pw]
         if region.size == 0:
             return x, y
-        if float(region.mean()) < 0.25:  # <= 25% overlap as last resort
+        if float(region.mean()) < 0.10:  # <= 10 % overlap as last resort
             return x, y
-    x = _center_biased_int(rng, x_lo, x_hi, bias=2.0)
-    y = _center_biased_int(rng, y_lo, y_hi, bias=2.0)
-    return x, y
+    # Pick the candidate with the least overlap.
+    best_x, best_y, best_overlap = x_lo, y_lo, 1.0
+    for _ in range(max_retry):
+        x = _center_biased_int(rng, x_lo, x_hi, bias=2.0)
+        y = _center_biased_int(rng, y_lo, y_hi, bias=2.0)
+        if occupied_mask is None or not occupied_mask.any():
+            return x, y
+        region = occupied_mask[y : y + ph, x : x + pw]
+        if region.size == 0:
+            return x, y
+        ov = float(region.mean())
+        if ov < best_overlap:
+            best_overlap, best_x, best_y = ov, x, y
+    return best_x, best_y
 
 
 # --------------------------------------------------------------------------- #
@@ -996,88 +1046,111 @@ def _render_ship_shadow(
     shadow_depth_range: tuple[float, float] = (18, 50),
     max_shadow_len: int = 70,
 ) -> np.ndarray:
-    """Render a thermal shadow on the water surface below the ship.
+    """Render a thermal shadow on the water surface around / below the ship.
 
-    The shadow is extruded from the ship's actual silhouette — each column
-    of the ship mask casts a ray downward at a randomised sun angle.  This
-    preserves the ship's outline so the shadow looks like it belongs to the
-    specific vessel rather than a generic trapezoid.
+    **Side-view**: silhouette-extruded directional shadow (sun-angle ray cast)
+    below the hull, with linear distance-based fade.
 
-    Shadow intensity fades linearly with distance from the hull so the
-    shadow looks natural rather than a hard cut-out.
-
-    Only applied for **side-view** backgrounds.
+    **Top-down view**: subtle isotropic dark halo around the ship silhouette
+    (the ship blocks IR radiation from the water directly below, creating a
+    cooler ring).  Depth and radius are smaller than side-view.
     """
-    if bg_view.kind != "side":
-        return composite
-
     H, W = composite.shape
-
-    # --- Per-column bottom profile of the ship mask ---
-    # bot_ys[x] = row of the lowest mask pixel in column x (H if no mask)
-    bot_ys = np.full(W, H, dtype=np.int32)
-    col_has_ship = np.any(full_mask, axis=0)
-    if not col_has_ship.any():
-        return composite
-
-    for x in np.where(col_has_ship)[0]:
-        hit = np.where(full_mask[:, x])[0]
-        bot_ys[x] = hit[-1]
-
-    x_min = int(np.where(col_has_ship)[0][0])
-    x_max = int(np.where(col_has_ship)[0][-1])
-    y_bot_max = int(bot_ys[col_has_ship].max())
-    y_bot_min = int(bot_ys[col_has_ship].min())
-    ship_h = y_bot_max - y_bot_min + 1
-
-    # --- Randomised sun geometry, capped ---
-    sun_angle = float(rng.uniform(-35.0, 35.0))        # degrees from vertical
-    raw_len = int(ship_h * float(rng.uniform(0.4, 1.6)) + 6)
-    shadow_len = min(raw_len, max_shadow_len,
-                     H - y_bot_max - 1)
-    shadow_len = max(6, shadow_len)
-
-    # --- Build shadow mask with distance-based fading gradient ---
     shadow_mask = np.zeros((H, W), dtype=np.float32)
 
-    for x in range(x_min, x_max + 1):
-        if bot_ys[x] >= H:
-            continue
-        y0 = bot_ys[x] + 1           # one pixel below the ship hull
-        if y0 >= H:
-            continue
-        # Horizontal drift for this column at full shadow length
-        dx_total = int(shadow_len * np.tan(np.radians(sun_angle)))
-        for dy in range(1, shadow_len + 1):
-            sy = y0 + dy - 1
-            if sy >= H:
-                break
-            # Linear fade: 1.0 at dy=1 → 0.0 at dy=shadow_len
-            alpha = 1.0 - float(dy) / float(shadow_len)
-            sx = x + int(dx_total * dy / shadow_len)
-            if 0 <= sx < W:
-                # Take max so the darkest projection wins at each pixel
-                if alpha > shadow_mask[sy, sx]:
-                    shadow_mask[sy, sx] = alpha
+    if bg_view.kind == "side":
+        # --- Per-column bottom profile of the ship mask ---
+        bot_ys = np.full(W, H, dtype=np.int32)
+        col_has_ship = np.any(full_mask, axis=0)
+        if not col_has_ship.any():
+            return composite
 
-    if shadow_mask.max() < 0.01:
+        for x in np.where(col_has_ship)[0]:
+            hit = np.where(full_mask[:, x])[0]
+            bot_ys[x] = hit[-1]
+
+        x_min = int(np.where(col_has_ship)[0][0])
+        x_max = int(np.where(col_has_ship)[0][-1])
+        y_bot_max = int(bot_ys[col_has_ship].max())
+        y_bot_min = int(bot_ys[col_has_ship].min())
+        ship_h = y_bot_max - y_bot_min + 1
+
+        # --- Randomised sun geometry, capped ---
+        sun_angle = float(rng.uniform(-35.0, 35.0))        # degrees from vertical
+        raw_len = int(ship_h * float(rng.uniform(0.4, 1.6)) + 6)
+        shadow_len = min(raw_len, max_shadow_len,
+                         H - y_bot_max - 1)
+        shadow_len = max(6, shadow_len)
+
+        for x in range(x_min, x_max + 1):
+            if bot_ys[x] >= H:
+                continue
+            y0 = bot_ys[x] + 1           # one pixel below the ship hull
+            if y0 >= H:
+                continue
+            dx_total = int(shadow_len * np.tan(np.radians(sun_angle)))
+            for dy in range(1, shadow_len + 1):
+                sy = y0 + dy - 1
+                if sy >= H:
+                    break
+                alpha = 1.0 - float(dy) / float(shadow_len)
+                sx = x + int(dx_total * dy / shadow_len)
+                if 0 <= sx < W:
+                    if alpha > shadow_mask[sy, sx]:
+                        shadow_mask[sy, sx] = alpha
+
+        if shadow_mask.max() < 0.01:
+            return composite
+
+        # --- Soften edges ---
+        sigma = float(rng.uniform(1.5, 3.5))
+        ksz = max(3, (int(sigma * 6) | 1))
+        shadow_mask = cv2.GaussianBlur(shadow_mask, (ksz, ksz), sigmaX=sigma)
+
+        # Do not darken the ship itself
+        shadow_mask[full_mask] = 0.0
+
+        # --- Apply darkening ---
+        depth = float(rng.uniform(*shadow_depth_range))
+        result = composite.astype(np.float32)
+        result -= shadow_mask * depth
+        np.clip(result, 0.0, 255.0, out=result)
+        return result.astype(np.uint8)
+
+    elif bg_view.kind == "top":
+        # --- Top-down: subtle isotropic dark halo around the ship ---
+        if not full_mask.any():
+            return composite
+
+        m_u8 = full_mask.astype(np.uint8)
+        # Dilate outward to form a ring around the ship silhouette.
+        halo_radius = int(rng.integers(8, 25))
+        k_dil = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * halo_radius + 1, 2 * halo_radius + 1)
+        )
+        dilated = cv2.dilate(m_u8, k_dil).astype(np.float32) / 255.0
+
+        # Build a distance-weighted alpha: 1.0 at mask edge → 0.0 at halo outer edge.
+        # Gaussian blur on the dilated mask gives a smooth radial falloff.
+        sigma = float(rng.uniform(3.0, 8.0))
+        ksz = max(3, (int(sigma * 6) | 1))
+        halo = cv2.GaussianBlur(dilated, (ksz, ksz), sigmaX=sigma)
+
+        # Subtract the ship interior so we only darken the ring.
+        halo[full_mask] = 0.0
+
+        if halo.max() < 0.02:
+            return composite
+
+        # Top-down shadow depth is much smaller than side-view.
+        top_depth = float(rng.uniform(5.0, 20.0))
+        result = composite.astype(np.float32)
+        result -= halo * top_depth
+        np.clip(result, 0.0, 255.0, out=result)
+        return result.astype(np.uint8)
+
+    else:
         return composite
-
-    # --- Soften edges ---
-    sigma = float(rng.uniform(1.5, 3.5))
-    ksz = max(3, (int(sigma * 6) | 1))
-    shadow_mask = cv2.GaussianBlur(shadow_mask, (ksz, ksz), sigmaX=sigma)
-
-    # Do not darken the ship itself
-    shadow_mask[full_mask] = 0.0
-
-    # --- Apply darkening ---
-    depth = float(rng.uniform(*shadow_depth_range))
-    result = composite.astype(np.float32)
-    result -= shadow_mask * depth
-    np.clip(result, 0.0, 255.0, out=result)
-
-    return result.astype(np.uint8)
 
 
 # --------------------------------------------------------------------------- #
@@ -1333,7 +1406,7 @@ def paste_patch(
 
     composite = _adaptive_boundary_blur(composite, full_mask)
 
-    if render_shadow and bg_view.kind == "side":
+    if render_shadow:
         composite = _render_ship_shadow(
             composite, full_mask, bg_view, rng, shadow_depth_range,
             max_shadow_len,
