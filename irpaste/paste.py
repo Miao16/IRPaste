@@ -486,9 +486,11 @@ def radiometric_match(
 
     # Internal contrast preservation: stretch dim ships so internal
     # structure (engine hot-spots, hull edges) stays visible.
+    # Capped at 2.0x to avoid amplifying tiny internal variations into
+    # visible speckle on otherwise uniform ship surfaces.
     min_internal_std = min_ship_bg_ratio * bg_std
     if tgt_std < min_internal_std:
-        scale_ic = min_internal_std / tgt_std
+        scale_ic = min(min_internal_std / tgt_std, 2.0)
         p_masked = p.copy()
         p_masked[mask] = new_mean + (p[mask] - new_mean) * scale_ic
         p = p_masked
@@ -739,13 +741,22 @@ def inject_matching_noise(
     sigma_tgt: float,
     rng: np.random.Generator,
 ) -> np.ndarray:
+    """Add Gaussian noise uniformly across the **entire** image to bring the
+    composite's apparent noise level closer to the background's sensor noise.
+
+    Noise is applied to every pixel (ship and background alike) so the ship
+    interior does not stand out as anomalously noisy or anomalously clean
+    relative to its surroundings.  Sigma is capped at ``max(3.0, 0.5*sigma_bg)``
+    to prevent over-noising when the synthetic target is very clean.
+    """
     extra = max(0.0, (sigma_bg * sigma_bg - sigma_tgt * sigma_tgt))
     if extra <= 1e-6:
         return img
     s = float(np.sqrt(extra))
+    # Cap noise so a near-zero sigma_tgt does not produce extreme speckle.
+    s = min(s, max(3.0, 0.5 * sigma_bg))
     noise = rng.normal(0, s, img.shape).astype(np.float32)
-    out = img.astype(np.float32)
-    out[mask] += noise[mask]
+    out = img.astype(np.float32) + noise
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
